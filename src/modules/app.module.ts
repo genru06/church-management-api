@@ -1,6 +1,8 @@
 import { Module } from "@nestjs/common";
+import { APP_GUARD } from "@nestjs/core";
 import { TypeOrmModule } from "@nestjs/typeorm";
 import { HealthController } from "../shared/health.controller";
+import { AuthGuard } from "../shared/auth.guard";
 import { AuthController } from "../modules/auth/auth.controller";
 import { AuthService } from "../modules/auth/auth.service";
 import { DashboardController } from "../modules/dashboard/dashboard.controller";
@@ -19,7 +21,11 @@ import { EventsController } from "../modules/events/events.controller";
 import { EventsService } from "../modules/events/events.service";
 import { OperationsController } from "../modules/operations/operations.controller";
 import { OperationsService } from "../modules/operations/operations.service";
+import { UsersController } from "../modules/users/users.controller";
+import { UsersService } from "../modules/users/users.service";
 import { UserEntity } from "../entities/user.entity";
+import { UserAccessTagEntity } from "../entities/user-access-tag.entity";
+import { UserTagEntity } from "../entities/user-tag.entity";
 import { MemberEntity } from "../entities/member.entity";
 import { ChurchEntity } from "../entities/church.entity";
 import { LifeGroupEntity } from "../entities/lifegroup.entity";
@@ -34,6 +40,25 @@ import { OfferingEntity } from "../entities/offering.entity";
 import { ExpenseEntity } from "../entities/expense.entity";
 import { VoucherEntity } from "../entities/voucher.entity";
 
+const entities = [
+  UserEntity,
+  UserAccessTagEntity,
+  UserTagEntity,
+  MemberEntity,
+  ChurchEntity,
+  LifeGroupEntity,
+  LifeGroupMemberEntity,
+  AttendanceEntity,
+  CityEntity,
+  EventEntity,
+  EventParticipantEntity,
+  EventPledgeEntity,
+  TitheEntity,
+  OfferingEntity,
+  ExpenseEntity,
+  VoucherEntity
+];
+
 @Module({
   imports: [
     TypeOrmModule.forRoot({
@@ -43,10 +68,10 @@ import { VoucherEntity } from "../entities/voucher.entity";
       username: process.env.DB_USER || "root",
       password: process.env.DB_PASSWORD || "",
       database: process.env.DB_NAME || "lifegroup_system",
-      entities: [UserEntity, MemberEntity, ChurchEntity, LifeGroupEntity, LifeGroupMemberEntity, AttendanceEntity, CityEntity, EventEntity, EventParticipantEntity, EventPledgeEntity, TitheEntity, OfferingEntity, ExpenseEntity, VoucherEntity],
+      entities,
       synchronize: false
     }),
-    TypeOrmModule.forFeature([UserEntity, MemberEntity, ChurchEntity, LifeGroupEntity, LifeGroupMemberEntity, AttendanceEntity, CityEntity, EventEntity, EventParticipantEntity, EventPledgeEntity, TitheEntity, OfferingEntity, ExpenseEntity, VoucherEntity])
+    TypeOrmModule.forFeature(entities)
   ],
   controllers: [
     HealthController,
@@ -58,9 +83,11 @@ import { VoucherEntity } from "../entities/voucher.entity";
     AttendanceController,
     CitiesController,
     EventsController,
-    OperationsController
+    OperationsController,
+    UsersController
   ],
   providers: [
+    { provide: APP_GUARD, useClass: AuthGuard },
     AuthService,
     DashboardService,
     MembersService,
@@ -69,7 +96,8 @@ import { VoucherEntity } from "../entities/voucher.entity";
     AttendanceService,
     CitiesService,
     EventsService,
-    OperationsService
+    OperationsService,
+    UsersService
   ]
 })
 export class AppModule {}

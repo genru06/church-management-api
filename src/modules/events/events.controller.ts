@@ -1,4 +1,5 @@
 import { Body, Controller, Delete, Get, Param, Post, Put } from "@nestjs/common";
+import { Public } from "../../shared/public.decorator";
 import { EventsService } from "./events.service";
 
 @Controller("events")
@@ -15,11 +16,13 @@ export class EventsController {
     return this.eventsService.list();
   }
 
+  @Public()
   @Get(":id/signup")
   getSignupInfo(@Param("id") id: string) {
     return this.eventsService.getSignupInfo(Number(id));
   }
 
+  @Public()
   @Post(":id/signup")
   publicSignup(@Param("id") id: string, @Body() body: any) {
     return this.eventsService.publicSignup(Number(id), body);
