@@ -104,9 +104,9 @@ export class ChurchesService {
           SELECT COUNT(*)
           FROM lifegroup_member lm
           WHERE lm.lifegroup_id = lg.id
-        ) + 1 AS memberCount
+        ) + CASE WHEN lg.coach_member_id IS NOT NULL THEN 1 ELSE 0 END AS memberCount
       FROM lifegroup lg
-      INNER JOIN member m ON m.id = lg.coach_member_id
+      LEFT JOIN member m ON m.id = lg.coach_member_id
       WHERE lg.church_id = ?
       ORDER BY lg.lifegroup_name ASC, lg.id ASC`,
       [id]
@@ -165,7 +165,7 @@ export class ChurchesService {
 
     return `SELECT lg.coach_member_id AS member_id
            FROM lifegroup lg
-           WHERE lg.church_id = ?
+           WHERE lg.church_id = ? AND lg.coach_member_id IS NOT NULL
            UNION
            SELECT lm.member_id
            FROM lifegroup_member lm

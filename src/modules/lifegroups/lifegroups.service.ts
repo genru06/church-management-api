@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, ConflictException } from "@nestjs/common";
+import { BadRequestException, Injectable, NotFoundException, ConflictException } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
 import { Repository } from "typeorm";
 import { LifeGroupEntity } from "../../entities/lifegroup.entity";
@@ -17,8 +17,8 @@ export class LifeGroupsService {
     const saved = await this.lifeGroupsRepo.save(
       this.lifeGroupsRepo.create({
         name: body.name,
-        coachMemberId: Number(body.coachMemberId),
-        churchId: body.churchId || null
+        coachMemberId: this.parseOptionalMemberId(body.coachMemberId),
+        churchId: this.parseRequiredChurchId(body.churchId)
       })
     );
     return this.view(saved.id);
@@ -37,7 +37,9 @@ export class LifeGroupsService {
   async view(id: number) {
     const row = await this.lifeGroupsRepo.findOne({ where: { id } });
     if (!row) throw new NotFoundException("LifeGroup not found");
-    const coach = await this.membersRepo.findOne({ where: { id: row.coachMemberId } });
+    const coach = row.coachMemberId
+      ? await this.membersRepo.findOne({ where: { id: row.coachMemberId } })
+      : null;
 
     const links = await this.lifeGroupMembersRepo.find({ where: { lifeGroupId: id } });
     const ids = links.map((l) => l.memberId);
@@ -119,10 +121,24 @@ export class LifeGroupsService {
     if (!existing) throw new NotFoundException("LifeGroup not found");
     await this.lifeGroupsRepo.update(id, {
       name: body.name,
-      coachMemberId: Number(body.coachMemberId),
-      churchId: body.churchId || null
+      coachMemberId: this.parseOptionalMemberId(body.coachMemberId),
+      churchId: this.parseRequiredChurchId(body.churchId)
     });
     return this.view(id);
+  }
+
+  private parseOptionalMemberId(value: unknown): number | null {
+    if (value === null || value === undefined || value === "") return null;
+    const id = Number(value);
+    return Number.isFinite(id) && id > 0 ? id : null;
+  }
+
+  private parseRequiredChurchId(value: unknown): number {
+    const id = Number(value);
+    if (!Number.isFinite(id) || id <= 0) {
+      throw new BadRequestException("Church is required");
+    }
+    return id;
   }
 
   async remove(id: number) {
