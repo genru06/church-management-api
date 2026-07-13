@@ -146,7 +146,9 @@ export class MembersService {
       nationality: body.nationality || null,
       churchId
     });
-    await this.setMemberTags(id, body.tags);
+    if (body?.tags !== undefined) {
+      await this.setMemberTags(id, body.tags);
+    }
     return this.view(id);
   }
 
@@ -291,7 +293,17 @@ export class MembersService {
 
   private normalizeTagNames(value: unknown): string[] {
     if (!Array.isArray(value)) return [];
-    return [...new Set(value.map((tag) => String(tag || "").trim()).filter(Boolean))];
+    const seen = new Set<string>();
+    const names: string[] = [];
+    for (const tag of value) {
+      const name = String(tag || "").trim();
+      if (!name) continue;
+      const key = name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      names.push(name);
+    }
+    return names;
   }
 
   private parseImportTagField(value?: string | null): string[] {
@@ -340,6 +352,24 @@ export class MembersService {
     return resolved;
   }
 
+  private async resolveTagsByNames(tagNames: string[]): Promise<TagEntity[]> {
+    const resolved: TagEntity[] = [];
+    const seenIds = new Set<number>();
+
+    for (const name of tagNames) {
+      const tag = await this.tagsRepo
+        .createQueryBuilder("tag")
+        .where("LOWER(tag.name) = LOWER(:name)", { name })
+        .getOne();
+      if (!tag) throw new BadRequestException(`Unknown tag: ${name}`);
+      if (seenIds.has(tag.id)) continue;
+      seenIds.add(tag.id);
+      resolved.push(tag);
+    }
+
+    return resolved;
+  }
+
   private async assignMemberTags(memberId: number, tags: TagEntity[]) {
     await this.memberTagsRepo.delete({ memberId });
     if (!tags.length) return;
@@ -350,12 +380,10 @@ export class MembersService {
 
   private async setMemberTags(memberId: number, value: unknown) {
     const tagNames = this.normalizeTagNames(value);
-    const tags = tagNames.length ? await this.tagsRepo.find({ where: { name: In(tagNames) } }) : [];
-    const missingTags = tagNames.filter((name) => !tags.some((tag) => tag.name === name));
-    if (missingTags.length) throw new BadRequestException(`Unknown tag: ${missingTags.join(", ")}`);
+    const tags = tagNames.length ? await this.resolveTagsByNames(tagNames) : [];
 
     await this.memberTagsRepo.delete({ memberId });
-    if (!tagNames.length) return;
+    if (!tags.length) return;
 
     await this.memberTagsRepo.save(tags.map((tag) => this.memberTagsRepo.create({ memberId, tagId: tag.id })));
   }

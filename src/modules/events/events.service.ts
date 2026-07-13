@@ -10,8 +10,14 @@ import { UserEntity } from "../../entities/user.entity";
 import { ChurchEntity } from "../../entities/church.entity";
 import { LifeGroupEntity } from "../../entities/lifegroup.entity";
 import { LifeGroupMemberEntity } from "../../entities/lifegroup-member.entity";
+import { MemberTagEntity } from "../../entities/member-tag.entity";
+import { TagEntity } from "../../entities/tag.entity";
 import { getChurchDisplayName } from "../../utils/church-display";
 import { loadPastorChurchesByMemberId, resolveMemberChurchId } from "../../utils/member-church";
+
+export const EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE = "LIFEGROUP_EVENT_PARTICIPANT_BULK_V2";
+
+const VALID_EVENT_PARTICIPANT_BULK_SIGNATURES = new Set([EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE]);
 
 @Injectable()
 export class EventsService {
@@ -23,7 +29,9 @@ export class EventsService {
     @InjectRepository(UserEntity) private readonly usersRepo: Repository<UserEntity>,
     @InjectRepository(ChurchEntity) private readonly churchesRepo: Repository<ChurchEntity>,
     @InjectRepository(LifeGroupEntity) private readonly lifeGroupsRepo: Repository<LifeGroupEntity>,
-    @InjectRepository(LifeGroupMemberEntity) private readonly lifeGroupMembersRepo: Repository<LifeGroupMemberEntity>
+    @InjectRepository(LifeGroupMemberEntity) private readonly lifeGroupMembersRepo: Repository<LifeGroupMemberEntity>,
+    @InjectRepository(MemberTagEntity) private readonly memberTagsRepo: Repository<MemberTagEntity>,
+    @InjectRepository(TagEntity) private readonly tagsRepo: Repository<TagEntity>
   ) {}
 
   private async resolveUserName(userId: number | null) {
@@ -295,6 +303,24 @@ export class EventsService {
     }
   }
 
+  private normalizeParticipantName(name: string) {
+    return name.trim().toLowerCase().replace(/\s+/g, " ");
+  }
+
+  private async assertGuestNotAlreadyRegistered(eventId: number, fullName: string) {
+    const normalized = this.normalizeParticipantName(fullName);
+    const existing = await this.participantsRepo
+      .createQueryBuilder("participant")
+      .where("participant.eventId = :eventId", { eventId })
+      .andWhere("participant.memberId IS NULL")
+      .andWhere("LOWER(TRIM(participant.fullName)) = :fullName", { fullName: normalized })
+      .getOne();
+
+    if (existing) {
+      throw new BadRequestException(`${fullName.trim()} is already registered for this event.`);
+    }
+  }
+
   private async createEventParticipant(event: EventEntity, member: MemberEntity) {
     const saved = await this.participantsRepo.save(
       this.participantsRepo.create({
@@ -303,6 +329,29 @@ export class EventsService {
         fullName: `${member.firstName} ${member.lastName}`,
         email: member.email,
         phone: member.phone,
+        qrToken: randomUUID().replace(/-/g, ""),
+        registrationPaid: false,
+        registrationAmount: event.registrationFee && Number(event.registrationFee) > 0 ? event.registrationFee : null
+      })
+    );
+    const [participant] = await this.enrichParticipants([saved]);
+    return participant;
+  }
+
+  private async createGuestEventParticipant(
+    event: EventEntity,
+    body: { fullName: string; email?: string | null; phone?: string | null }
+  ) {
+    const fullName = body.fullName.trim();
+    await this.assertGuestNotAlreadyRegistered(event.id, fullName);
+
+    const saved = await this.participantsRepo.save(
+      this.participantsRepo.create({
+        eventId: event.id,
+        memberId: null,
+        fullName,
+        email: body.email?.trim() || null,
+        phone: body.phone?.trim() || null,
         qrToken: randomUUID().replace(/-/g, ""),
         registrationPaid: false,
         registrationAmount: event.registrationFee && Number(event.registrationFee) > 0 ? event.registrationFee : null
@@ -419,33 +468,298 @@ export class EventsService {
     return this.enrichParticipants(rows);
   }
 
+  private async resolveChurchId(churchId: number | string | null | undefined) {
+    if (churchId == null || churchId === "") return null;
+    const id = Number(churchId);
+    if (!id || Number.isNaN(id)) return null;
+    const church = await this.churchesRepo.findOne({ where: { id } });
+    if (!church) return null;
+    return id;
+  }
+
+  private buildParticipantNameKey(firstName: string, lastName: string) {
+    return `${firstName.trim().toLowerCase()}|${lastName.trim().toLowerCase()}`;
+  }
+
+  private parseImportTagField(value?: string | null): string[] {
+    if (!value?.trim()) return [];
+    const seen = new Set<string>();
+    const names: string[] = [];
+    for (const part of value.split(",")) {
+      const tag = part.trim();
+      if (!tag) continue;
+      const key = tag.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      names.push(tag);
+    }
+    return names;
+  }
+
+  private async resolveImportTags(
+    tagNames: string[],
+    tagCache: Map<string, TagEntity>
+  ): Promise<TagEntity[]> {
+    const resolved: TagEntity[] = [];
+
+    for (const name of tagNames) {
+      const key = name.toLowerCase();
+      let tag = tagCache.get(key);
+      if (!tag) {
+        try {
+          tag = await this.tagsRepo.save(this.tagsRepo.create({ name }));
+        } catch (err: any) {
+          if (err?.code === "ER_DUP_ENTRY") {
+            tag = await this.tagsRepo
+              .createQueryBuilder("tag")
+              .where("LOWER(tag.name) = LOWER(:name)", { name })
+              .getOne();
+            if (!tag) throw err;
+          } else {
+            throw err;
+          }
+        }
+        tagCache.set(key, tag);
+      }
+      resolved.push(tag);
+    }
+
+    return resolved;
+  }
+
+  private async assignMemberTags(memberId: number, tags: TagEntity[]) {
+    await this.memberTagsRepo.delete({ memberId });
+    if (!tags.length) return;
+    await this.memberTagsRepo.save(
+      tags.map((tag) => this.memberTagsRepo.create({ memberId, tagId: tag.id }))
+    );
+  }
+
+  async importParticipantsBulk(
+    eventId: number,
+    body: {
+      signature?: string;
+      eventId?: number | string;
+      churchId?: number | string | null;
+      participants?: any[];
+    }
+  ) {
+    if (!body?.signature || !VALID_EVENT_PARTICIPANT_BULK_SIGNATURES.has(body.signature)) {
+      throw new BadRequestException(
+        "Invalid or missing template signature. Please download and use the participant import template from this system."
+      );
+    }
+
+    const templateEventId = body.eventId != null ? Number(body.eventId) : null;
+    if (!templateEventId || Number.isNaN(templateEventId)) {
+      throw new BadRequestException("The event identifier in this template is invalid.");
+    }
+    if (templateEventId !== eventId) {
+      throw new BadRequestException(
+        "This template belongs to a different event. Download the template from the event you are importing into."
+      );
+    }
+
+    const event = await this.getEventOrFail(eventId);
+    const rows = Array.isArray(body.participants) ? body.participants : [];
+    if (!rows.length) {
+      throw new BadRequestException("No participant rows were provided for import.");
+    }
+
+    let importChurchId: number | null = null;
+    if (body.churchId != null && body.churchId !== "") {
+      importChurchId = await this.resolveChurchId(body.churchId);
+      if (!importChurchId) {
+        throw new BadRequestException("The church identifier in this template is invalid.");
+      }
+    }
+
+    const existingParticipants = await this.participantsRepo.find({
+      where: { eventId },
+      select: ["memberId", "fullName"]
+    });
+    const registeredMemberIds = new Set(
+      existingParticipants.map((row) => row.memberId).filter(Boolean) as number[]
+    );
+    const registeredGuestNames = new Set(
+      existingParticipants
+        .filter((row) => !row.memberId && row.fullName)
+        .map((row) => this.normalizeParticipantName(row.fullName))
+    );
+    const batchNames = new Map<string, number>();
+    const importTagCache = new Map(
+      (await this.tagsRepo.find()).map((tag) => [tag.name.toLowerCase(), tag])
+    );
+
+    const created: Awaited<ReturnType<EventsService["createEventParticipant"]>>[] = [];
+    const errors: { row: number; message: string }[] = [];
+
+    for (const row of rows) {
+      const rowNumber = Number(row?.rowNumber) || 0;
+      const firstName = row?.firstName?.trim();
+      const lastName = row?.lastName?.trim();
+
+      if (!firstName || !lastName) {
+        errors.push({
+          row: rowNumber,
+          message: "First name and last name are required."
+        });
+        continue;
+      }
+
+      const fullName = `${firstName} ${lastName}`;
+      const nameKey = this.buildParticipantNameKey(firstName, lastName);
+      if (batchNames.has(nameKey)) {
+        errors.push({
+          row: rowNumber,
+          message: `Duplicate name in this file (also on row ${batchNames.get(nameKey)}).`
+        });
+        continue;
+      }
+      batchNames.set(nameKey, rowNumber);
+
+      try {
+        const member = await this.findMemberByName(firstName, lastName);
+        const tagNames = this.parseImportTagField(row?.tag);
+
+        if (importChurchId) {
+          let resolvedMember = member;
+
+          if (!resolvedMember) {
+            resolvedMember = await this.membersRepo.save(
+              this.membersRepo.create({
+                firstName,
+                lastName,
+                email: null,
+                phone: row.phone?.trim() || null,
+                gender: "",
+                churchId: importChurchId
+              })
+            );
+            if (tagNames.length) {
+              const tags = await this.resolveImportTags(tagNames, importTagCache);
+              await this.assignMemberTags(resolvedMember.id, tags);
+            }
+          } else {
+            const updates: Partial<MemberEntity> = {};
+            if (row.phone?.trim()) updates.phone = row.phone.trim();
+            updates.churchId = importChurchId;
+            await this.membersRepo.update(resolvedMember.id, updates);
+            resolvedMember = { ...resolvedMember, ...updates };
+            if (tagNames.length) {
+              const tags = await this.resolveImportTags(tagNames, importTagCache);
+              await this.assignMemberTags(resolvedMember.id, tags);
+            }
+          }
+
+          if (registeredMemberIds.has(resolvedMember.id)) {
+            errors.push({
+              row: rowNumber,
+              message: `${fullName} is already registered for this event.`
+            });
+            continue;
+          }
+
+          const participant = await this.createEventParticipant(event, resolvedMember);
+          registeredMemberIds.add(resolvedMember.id);
+          created.push(participant);
+          continue;
+        }
+
+        if (member) {
+          if (registeredMemberIds.has(member.id)) {
+            errors.push({
+              row: rowNumber,
+              message: `${fullName} is already registered for this event.`
+            });
+            continue;
+          }
+
+          const participant = await this.createEventParticipant(event, member);
+          registeredMemberIds.add(member.id);
+          created.push(participant);
+          continue;
+        }
+
+        const guestNameKey = this.normalizeParticipantName(fullName);
+        if (registeredGuestNames.has(guestNameKey)) {
+          errors.push({
+            row: rowNumber,
+            message: `${fullName} is already registered for this event.`
+          });
+          continue;
+        }
+
+        const participant = await this.createGuestEventParticipant(event, {
+          fullName,
+          phone: row.phone?.trim() || null
+        });
+        registeredGuestNames.add(guestNameKey);
+        created.push(participant);
+      } catch (err) {
+        errors.push({
+          row: rowNumber,
+          message: err instanceof Error ? err.message : "Failed to add participant."
+        });
+      }
+    }
+
+    return {
+      created: created.length,
+      participants: created,
+      errors
+    };
+  }
+
   async addParticipant(eventId: number, body: any) {
     const event = await this.getEventOrFail(eventId);
     const churchId = body.churchId ? Number(body.churchId) : null;
     const lifegroupId = body.lifegroupId ? Number(body.lifegroupId) : null;
-    let member: MemberEntity | null = null;
+    const addAsMember = !!body.addAsMember;
 
     if (body.memberId) {
-      member = await this.membersRepo.findOne({ where: { id: Number(body.memberId) } });
+      const member = await this.membersRepo.findOne({ where: { id: Number(body.memberId) } });
       if (!member) throw new NotFoundException("Member not found");
       await this.ensureLifegroupMembership(member.id, lifegroupId);
       if (churchId) {
         await this.membersRepo.update(member.id, { churchId });
-        member = { ...member, churchId };
       }
-    } else {
+      if (churchId) await this.validateChurchAndLifeGroup(churchId, lifegroupId);
+      await this.assertNotAlreadyRegistered(eventId, member.id);
+      return this.createEventParticipant(event, member);
+    }
+
+    if (addAsMember) {
+      if (!churchId) {
+        throw new BadRequestException("Church is required when adding a participant as a member.");
+      }
+
       const name = this.buildParticipantName(body);
       if (!name.firstName || !name.lastName) {
         throw new BadRequestException("Participant first name and last name are required");
       }
-      const resolved = await this.resolveMemberForRegistration(name.firstName, name.lastName, lifegroupId, churchId);
-      member = resolved.member;
+
+      await this.validateChurchAndLifeGroup(churchId, lifegroupId);
+      const { member } = await this.resolveMemberForRegistration(
+        name.firstName,
+        name.lastName,
+        lifegroupId,
+        churchId
+      );
+      await this.assertNotAlreadyRegistered(eventId, member.id);
+      return this.createEventParticipant(event, member);
     }
 
-    if (churchId) await this.validateChurchAndLifeGroup(churchId, lifegroupId);
-    await this.assertNotAlreadyRegistered(eventId, member.id);
+    const fullName = body.fullName?.trim();
+    if (!fullName) {
+      throw new BadRequestException("Participant full name is required");
+    }
 
-    return this.createEventParticipant(event, member);
+    return this.createGuestEventParticipant(event, {
+      fullName,
+      email: body.email,
+      phone: body.phone
+    });
   }
 
   async editParticipant(eventId: number, participantId: number, body: any) {
