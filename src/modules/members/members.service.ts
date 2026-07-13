@@ -62,7 +62,9 @@ export class MembersService {
   }
 
   async list(search?: string, tag?: string) {
-    const qb = this.membersRepo.createQueryBuilder("member").orderBy("member.id", "DESC");
+    const qb = this.membersRepo.createQueryBuilder("member")
+      .orderBy("member.lastName", "ASC")
+      .addOrderBy("member.firstName", "ASC");
     const term = search?.trim();
     if (term) {
       qb.andWhere("(member.firstName LIKE :term OR member.lastName LIKE :term)", { term: `%${term}%` });
