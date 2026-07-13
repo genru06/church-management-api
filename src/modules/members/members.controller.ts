@@ -16,8 +16,8 @@ export class MembersController {
   }
 
   @Get()
-  list(@Query("search") search?: string) {
-    return this.membersService.list(search);
+  list(@Query("search") search?: string, @Query("tag") tag?: string) {
+    return this.membersService.list(search, tag);
   }
 
   @Get(":id")

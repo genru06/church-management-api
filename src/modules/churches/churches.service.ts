@@ -56,7 +56,7 @@ export class ChurchesService {
     if (!row) throw new NotFoundException("Church not found");
 
     const memberSubquery = this.churchMemberSubquery(true);
-    const memberParams = [id, id, id, id];
+    const memberParams = [id, id, id, id, id, id, id];
 
     const rows = await this.churchesRepo.query(
       `SELECT
@@ -64,6 +64,19 @@ export class ChurchesService {
         m.last_name AS lastName,
         m.first_name AS firstName,
         m.date_of_birth AS dateOfBirth,
+        CASE WHEN m.church_id = ? THEN 1 ELSE 0 END AS linkedDirectly,
+        CASE WHEN EXISTS (
+          SELECT 1
+          FROM lifegroup lg
+          WHERE lg.church_id = ?
+            AND (
+              lg.coach_member_id = m.id
+              OR EXISTS (
+                SELECT 1 FROM lifegroup_member lm
+                WHERE lm.lifegroup_id = lg.id AND lm.member_id = m.id
+              )
+            )
+        ) THEN 1 ELSE 0 END AS linkedViaLifeGroup,
         NULLIF((
           SELECT GROUP_CONCAT(DISTINCT lg.lifegroup_name ORDER BY lg.lifegroup_name SEPARATOR ', ')
           FROM lifegroup lg
@@ -75,11 +88,17 @@ export class ChurchesService {
                 WHERE lm.lifegroup_id = lg.id AND lm.member_id = m.id
               )
             )
-        ), '') AS lifeGroup
+        ), '') AS lifeGroup,
+        NULLIF((
+          SELECT GROUP_CONCAT(DISTINCT t.name ORDER BY t.name SEPARATOR ', ')
+          FROM member_tag mt
+          INNER JOIN tag t ON t.id = mt.tag_id
+          WHERE mt.member_id = m.id
+        ), '') AS tags
       FROM member m
       WHERE m.id IN (${memberSubquery})
       ORDER BY m.last_name ASC, m.first_name ASC, m.id ASC`,
-      [id, ...memberParams]
+      memberParams
     );
 
     return rows.map((member: any) => ({
@@ -87,7 +106,12 @@ export class ChurchesService {
       lastName: member.lastName,
       firstName: member.firstName,
       dateOfBirth: member.dateOfBirth || null,
-      lifeGroup: member.lifeGroup || null
+      lifeGroup: member.lifeGroup || null,
+      tags: member.tags ? String(member.tags).split(", ") : [],
+      linkType: this.formatMemberLinkType(
+        Number(member.linkedDirectly) === 1,
+        Number(member.linkedViaLifeGroup) === 1
+      )
     }));
   }
 
@@ -184,7 +208,8 @@ export class ChurchesService {
     const memberParams = [churchId, churchId, churchId, churchId];
     const lifeGroupMemberParams = [churchId, churchId, churchId];
 
-    const [memberRow, lifeGroupMemberRow, directMemberRow, lifeGroupCount, eventsRow] = await Promise.all([
+    const [memberRow, lifeGroupMemberRow, directMemberRow, kidsMemberRow, lifeGroupCount, eventsRow] =
+      await Promise.all([
       this.churchesRepo.query(
         `SELECT COUNT(DISTINCT member_id) AS count
          FROM (${memberSubquery}) AS church_members`,
@@ -196,6 +221,14 @@ export class ChurchesService {
         lifeGroupMemberParams
       ),
       this.churchesRepo.query(`SELECT COUNT(*) AS count FROM member m WHERE m.church_id = ?`, [churchId]),
+      this.churchesRepo.query(
+        `SELECT COUNT(DISTINCT m.id) AS count
+         FROM member m
+         INNER JOIN member_tag mt ON mt.member_id = m.id
+         INNER JOIN tag t ON t.id = mt.tag_id AND LOWER(t.name) = 'kids'
+         WHERE m.id IN (${memberSubquery})`,
+        memberParams
+      ),
       this.lifeGroupsRepo.count({ where: { churchId } }),
       this.churchesRepo.query(
         `SELECT COUNT(DISTINCT ep.event_id) AS count
@@ -209,9 +242,17 @@ export class ChurchesService {
       memberCount: Number(memberRow[0]?.count || 0),
       lifeGroupMemberCount: Number(lifeGroupMemberRow[0]?.count || 0),
       directMemberCount: Number(directMemberRow[0]?.count || 0),
+      kidsMemberCount: Number(kidsMemberRow[0]?.count || 0),
       lifeGroupCount,
       eventsParticipated: Number(eventsRow[0]?.count || 0)
     };
+  }
+
+  private formatMemberLinkType(linkedDirectly: boolean, linkedViaLifeGroup: boolean) {
+    const parts: string[] = [];
+    if (linkedDirectly) parts.push("Direct");
+    if (linkedViaLifeGroup) parts.push("Lifegroup");
+    return parts.length ? parts.join(" · ") : "—";
   }
 
   async edit(id: number, body: any) {

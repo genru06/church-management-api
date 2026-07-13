@@ -2,17 +2,34 @@ import { BadRequestException, Injectable, NotFoundException } from "@nestjs/comm
 import { InjectRepository } from "@nestjs/typeorm";
 import { In, Like, Repository } from "typeorm";
 import { MemberEntity } from "../../entities/member.entity";
+import { MemberTagEntity } from "../../entities/member-tag.entity";
+import { TagEntity } from "../../entities/tag.entity";
 import { CityEntity } from "../../entities/city.entity";
 import { ChurchEntity } from "../../entities/church.entity";
 import { getChurchDisplayName } from "../../utils/church-display";
 import { loadPastorChurchesByMemberId, resolveMemberChurchId } from "../../utils/member-church";
+import {
+  buildMemberDuplicateIndex,
+  findMemberDuplicate,
+  registerMemberDuplicateName
+} from "../../utils/member-duplicate";
 
 export const MEMBER_BULK_TEMPLATE_SIGNATURE = "LIFEGROUP_MEMBER_BULK_V1";
+export const MEMBER_BULK_TEMPLATE_SIGNATURE_V2 = "LIFEGROUP_MEMBER_BULK_V2";
+export const MEMBER_BULK_TEMPLATE_SIGNATURE_V3 = "LIFEGROUP_MEMBER_BULK_V3";
+
+const VALID_MEMBER_BULK_SIGNATURES = new Set([
+  MEMBER_BULK_TEMPLATE_SIGNATURE,
+  MEMBER_BULK_TEMPLATE_SIGNATURE_V2,
+  MEMBER_BULK_TEMPLATE_SIGNATURE_V3
+]);
 
 @Injectable()
 export class MembersService {
   constructor(
     @InjectRepository(MemberEntity) private readonly membersRepo: Repository<MemberEntity>,
+    @InjectRepository(MemberTagEntity) private readonly memberTagsRepo: Repository<MemberTagEntity>,
+    @InjectRepository(TagEntity) private readonly tagsRepo: Repository<TagEntity>,
     @InjectRepository(CityEntity) private readonly citiesRepo: Repository<CityEntity>,
     @InjectRepository(ChurchEntity) private readonly churchesRepo: Repository<ChurchEntity>
   ) {}
@@ -40,17 +57,27 @@ export class MembersService {
         churchId
       })
     );
+    await this.setMemberTags(saved.id, body.tags);
     return this.view(saved.id);
   }
 
-  async list(search?: string) {
+  async list(search?: string, tag?: string) {
     const qb = this.membersRepo.createQueryBuilder("member").orderBy("member.id", "DESC");
     const term = search?.trim();
     if (term) {
       qb.andWhere("(member.firstName LIKE :term OR member.lastName LIKE :term)", { term: `%${term}%` });
     }
+
+    const tagTerm = tag?.trim();
+    if (tagTerm) {
+      const taggedIds = await this.getMemberIdsByTagName(tagTerm);
+      if (!taggedIds.length) return [];
+      qb.andWhere("member.id IN (:...taggedIds)", { taggedIds });
+    }
+
     const rows = await qb.getMany();
-    const memberIds = rows.map((row) => row.id);
+    const memberIds = rows.map((row) => Number(row.id));
+    const tagMap = await this.loadMemberTags(memberIds);
     const pastorChurchByMemberId = await loadPastorChurchesByMemberId(this.churchesRepo, memberIds);
     const cityIds = [...new Set(rows.map((row) => row.cityId).filter(Boolean))];
     const churchIds = [
@@ -72,7 +99,8 @@ export class MembersService {
         ...row,
         churchId,
         city: row.cityId ? cityMap.get(row.cityId) || null : null,
-        church: churchId ? churchMap.get(churchId) || null : null
+        church: churchId ? churchMap.get(churchId) || null : null,
+        tags: tagMap.get(Number(row.id)) || []
       };
     });
   }
@@ -88,7 +116,8 @@ export class MembersService {
       ...row,
       churchId,
       city: city?.munCity || null,
-      church: church ? getChurchDisplayName(church) : null
+      church: church ? getChurchDisplayName(church) : null,
+      tags: (await this.loadMemberTags([id])).get(Number(id)) || []
     };
   }
 
@@ -115,6 +144,7 @@ export class MembersService {
       nationality: body.nationality || null,
       churchId
     });
+    await this.setMemberTags(id, body.tags);
     return this.view(id);
   }
 
@@ -125,8 +155,8 @@ export class MembersService {
     return { id, deleted: true };
   }
 
-  async importBulk(body: { signature?: string; members?: any[] }) {
-    if (body?.signature !== MEMBER_BULK_TEMPLATE_SIGNATURE) {
+  async importBulk(body: { signature?: string; churchId?: number | string | null; members?: any[] }) {
+    if (!body?.signature || !VALID_MEMBER_BULK_SIGNATURES.has(body.signature)) {
       throw new BadRequestException(
         "Invalid or missing template signature. Please download and use the member import template from this system."
       );
@@ -136,6 +166,23 @@ export class MembersService {
     if (!rows.length) {
       throw new BadRequestException("No member rows were provided for import.");
     }
+
+    let importChurchId: number | null = null;
+    if (body.churchId != null && body.churchId !== "") {
+      importChurchId = await this.resolveChurchId(body.churchId);
+      if (!importChurchId) {
+        throw new BadRequestException("The church identifier in this template is invalid.");
+      }
+    }
+
+    const existingMembers = await this.membersRepo.find({
+      select: ["firstName", "lastName"]
+    });
+    const duplicateIndex = buildMemberDuplicateIndex(existingMembers);
+    const batchNames = new Map<string, number>();
+    const importTagCache = new Map(
+      (await this.tagsRepo.find()).map((tag) => [tag.name.toLowerCase(), tag])
+    );
 
     const created: Awaited<ReturnType<MembersService["view"]>>[] = [];
     const errors: { row: number; message: string }[] = [];
@@ -153,6 +200,17 @@ export class MembersService {
         continue;
       }
 
+      const duplicateMessage = findMemberDuplicate(
+        { firstName, lastName },
+        duplicateIndex,
+        batchNames,
+        rowNumber
+      );
+      if (duplicateMessage) {
+        errors.push({ row: rowNumber, message: duplicateMessage });
+        continue;
+      }
+
       try {
         const cityId = await this.resolveCityId(row?.city);
         if (row?.city?.trim() && !cityId) {
@@ -162,6 +220,8 @@ export class MembersService {
           });
           continue;
         }
+
+        const tagNames = this.parseImportTagField(row?.tag);
 
         const saved = await this.membersRepo.save(
           this.membersRepo.create({
@@ -177,10 +237,16 @@ export class MembersService {
             dateOfBirth: row.dateOfBirth?.trim() || null,
             gender: row.gender?.trim() || "",
             maritalStatus: row.maritalStatus?.trim() || null,
-            nationality: row.nationality?.trim() || null
+            nationality: row.nationality?.trim() || null,
+            churchId: importChurchId
           })
         );
+        if (tagNames.length) {
+          const tags = await this.resolveImportTags(tagNames, importTagCache);
+          await this.assignMemberTags(saved.id, tags);
+        }
         created.push(await this.view(saved.id));
+        registerMemberDuplicateName({ firstName, lastName }, duplicateIndex, batchNames, rowNumber);
       } catch (err: any) {
         const message =
           err?.code === "ER_DUP_ENTRY"
@@ -219,5 +285,110 @@ export class MembersService {
 
     if (matches.length === 1) return matches[0].id;
     return null;
+  }
+
+  private normalizeTagNames(value: unknown): string[] {
+    if (!Array.isArray(value)) return [];
+    return [...new Set(value.map((tag) => String(tag || "").trim()).filter(Boolean))];
+  }
+
+  private parseImportTagField(value?: string | null): string[] {
+    if (!value?.trim()) return [];
+    const seen = new Set<string>();
+    const names: string[] = [];
+    for (const part of value.split(",")) {
+      const tag = part.trim();
+      if (!tag) continue;
+      const key = tag.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      names.push(tag);
+    }
+    return names;
+  }
+
+  private async resolveImportTags(
+    tagNames: string[],
+    tagCache: Map<string, TagEntity>
+  ): Promise<TagEntity[]> {
+    const resolved: TagEntity[] = [];
+
+    for (const name of tagNames) {
+      const key = name.toLowerCase();
+      let tag = tagCache.get(key);
+      if (!tag) {
+        try {
+          tag = await this.tagsRepo.save(this.tagsRepo.create({ name }));
+        } catch (err: any) {
+          if (err?.code === "ER_DUP_ENTRY") {
+            tag = await this.tagsRepo
+              .createQueryBuilder("tag")
+              .where("LOWER(tag.name) = LOWER(:name)", { name })
+              .getOne();
+            if (!tag) throw err;
+          } else {
+            throw err;
+          }
+        }
+        tagCache.set(key, tag);
+      }
+      resolved.push(tag);
+    }
+
+    return resolved;
+  }
+
+  private async assignMemberTags(memberId: number, tags: TagEntity[]) {
+    await this.memberTagsRepo.delete({ memberId });
+    if (!tags.length) return;
+    await this.memberTagsRepo.save(
+      tags.map((tag) => this.memberTagsRepo.create({ memberId, tagId: tag.id }))
+    );
+  }
+
+  private async setMemberTags(memberId: number, value: unknown) {
+    const tagNames = this.normalizeTagNames(value);
+    const tags = tagNames.length ? await this.tagsRepo.find({ where: { name: In(tagNames) } }) : [];
+    const missingTags = tagNames.filter((name) => !tags.some((tag) => tag.name === name));
+    if (missingTags.length) throw new BadRequestException(`Unknown tag: ${missingTags.join(", ")}`);
+
+    await this.memberTagsRepo.delete({ memberId });
+    if (!tagNames.length) return;
+
+    await this.memberTagsRepo.save(tags.map((tag) => this.memberTagsRepo.create({ memberId, tagId: tag.id })));
+  }
+
+  private async getMemberIdsByTagName(tagName: string) {
+    const rows = await this.membersRepo.query(
+      `SELECT DISTINCT m.id AS id
+       FROM member m
+       INNER JOIN member_tag mt ON mt.member_id = m.id
+       INNER JOIN tag t ON t.id = mt.tag_id AND LOWER(t.name) = LOWER(?)
+       ORDER BY m.id DESC`,
+      [tagName]
+    );
+    return rows.map((row: { id: string | number }) => Number(row.id));
+  }
+
+  private async loadMemberTags(memberIds: number[]) {
+    const map = new Map<number, string[]>();
+    if (!memberIds.length) return map;
+
+    const rows = await this.memberTagsRepo
+      .createQueryBuilder("mt")
+      .innerJoin(TagEntity, "tag", "tag.id = mt.tag_id")
+      .select("mt.member_id", "memberId")
+      .addSelect("tag.name", "name")
+      .where("mt.member_id IN (:...memberIds)", { memberIds })
+      .orderBy("tag.name", "ASC")
+      .getRawMany<{ memberId: string; name: string }>();
+
+    rows.forEach((row) => {
+      const memberId = Number(row.memberId);
+      const existing = map.get(memberId) || [];
+      existing.push(row.name);
+      map.set(memberId, existing);
+    });
+    return map;
   }
 }

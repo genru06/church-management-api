@@ -23,10 +23,14 @@ import { OperationsController } from "../modules/operations/operations.controlle
 import { OperationsService } from "../modules/operations/operations.service";
 import { UsersController } from "../modules/users/users.controller";
 import { UsersService } from "../modules/users/users.service";
+import { TagsController } from "../modules/tags/tags.controller";
+import { TagsService } from "../modules/tags/tags.service";
 import { UserEntity } from "../entities/user.entity";
 import { UserAccessTagEntity } from "../entities/user-access-tag.entity";
 import { UserTagEntity } from "../entities/user-tag.entity";
 import { MemberEntity } from "../entities/member.entity";
+import { MemberTagEntity } from "../entities/member-tag.entity";
+import { TagEntity } from "../entities/tag.entity";
 import { ChurchEntity } from "../entities/church.entity";
 import { LifeGroupEntity } from "../entities/lifegroup.entity";
 import { LifeGroupMemberEntity } from "../entities/lifegroup-member.entity";
@@ -45,6 +49,8 @@ const entities = [
   UserAccessTagEntity,
   UserTagEntity,
   MemberEntity,
+  MemberTagEntity,
+  TagEntity,
   ChurchEntity,
   LifeGroupEntity,
   LifeGroupMemberEntity,
@@ -84,7 +90,8 @@ const entities = [
     CitiesController,
     EventsController,
     OperationsController,
-    UsersController
+    UsersController,
+    TagsController
   ],
   providers: [
     { provide: APP_GUARD, useClass: AuthGuard },
@@ -97,7 +104,8 @@ const entities = [
     CitiesService,
     EventsService,
     OperationsService,
-    UsersService
+    UsersService,
+    TagsService
   ]
 })
 export class AppModule {}
