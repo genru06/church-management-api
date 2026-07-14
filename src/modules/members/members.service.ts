@@ -61,7 +61,7 @@ export class MembersService {
     return this.view(saved.id);
   }
 
-  async list(search?: string, tag?: string) {
+  async list(search?: string, tag?: string | string[]) {
     const qb = this.membersRepo.createQueryBuilder("member")
       .orderBy("member.lastName", "ASC")
       .addOrderBy("member.firstName", "ASC");
@@ -70,9 +70,9 @@ export class MembersService {
       qb.andWhere("(member.firstName LIKE :term OR member.lastName LIKE :term)", { term: `%${term}%` });
     }
 
-    const tagTerm = tag?.trim();
-    if (tagTerm) {
-      const taggedIds = await this.getMemberIdsByTagName(tagTerm);
+    const tagTerms = this.normalizeTagFilter(tag);
+    if (tagTerms.length) {
+      const taggedIds = await this.getMemberIdsByTagNames(tagTerms);
       if (!taggedIds.length) return [];
       qb.andWhere("member.id IN (:...taggedIds)", { taggedIds });
     }
@@ -393,14 +393,36 @@ export class MembersService {
     await this.memberTagsRepo.save(tags.map((tag) => this.memberTagsRepo.create({ memberId, tagId: tag.id })));
   }
 
-  private async getMemberIdsByTagName(tagName: string) {
+  private normalizeTagFilter(tag?: string | string[]) {
+    const raw = Array.isArray(tag) ? tag : tag != null ? [tag] : [];
+    const seen = new Set<string>();
+    const names: string[] = [];
+
+    for (const entry of raw) {
+      for (const part of String(entry || "").split(",")) {
+        const name = part.trim();
+        if (!name) continue;
+        const key = name.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        names.push(name);
+      }
+    }
+
+    return names;
+  }
+
+  private async getMemberIdsByTagNames(tagNames: string[]) {
+    if (!tagNames.length) return [];
+
+    const placeholders = tagNames.map(() => "?").join(",");
     const rows = await this.membersRepo.query(
       `SELECT DISTINCT m.id AS id
        FROM member m
        INNER JOIN member_tag mt ON mt.member_id = m.id
-       INNER JOIN tag t ON t.id = mt.tag_id AND LOWER(t.name) = LOWER(?)
+       INNER JOIN tag t ON t.id = mt.tag_id AND LOWER(t.name) IN (${placeholders})
        ORDER BY m.id DESC`,
-      [tagName]
+      tagNames.map((name) => name.toLowerCase())
     );
     return rows.map((row: { id: string | number }) => Number(row.id));
   }

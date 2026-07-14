@@ -15,9 +15,13 @@ import { TagEntity } from "../../entities/tag.entity";
 import { getChurchDisplayName } from "../../utils/church-display";
 import { loadPastorChurchesByMemberId, resolveMemberChurchId } from "../../utils/member-church";
 
-export const EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE = "LIFEGROUP_EVENT_PARTICIPANT_BULK_V2";
+export const EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE_V2 = "LIFEGROUP_EVENT_PARTICIPANT_BULK_V2";
+export const EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE = "LIFEGROUP_EVENT_PARTICIPANT_BULK_V3";
 
-const VALID_EVENT_PARTICIPANT_BULK_SIGNATURES = new Set([EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE]);
+const VALID_EVENT_PARTICIPANT_BULK_SIGNATURES = new Set([
+  EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE_V2,
+  EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE
+]);
 
 @Injectable()
 export class EventsService {
@@ -264,6 +268,59 @@ export class EventsService {
         parentMemberId: null
       })
     );
+  }
+
+  private async findOrCreateLifeGroupForChurch(
+    name: string,
+    churchId: number,
+    cache: Map<string, LifeGroupEntity>
+  ) {
+    const trimmed = name.trim();
+    if (!trimmed) return null;
+
+    const cacheKey = `${churchId}:${trimmed.toLowerCase()}`;
+    const cached = cache.get(cacheKey);
+    if (cached) return cached;
+
+    let lifeGroup = await this.lifeGroupsRepo
+      .createQueryBuilder("lg")
+      .where("LOWER(lg.name) = LOWER(:name)", { name: trimmed })
+      .andWhere("lg.churchId = :churchId", { churchId })
+      .getOne();
+
+    if (!lifeGroup) {
+      lifeGroup = await this.lifeGroupsRepo.save(
+        this.lifeGroupsRepo.create({
+          name: trimmed,
+          coachMemberId: null,
+          churchId
+        })
+      );
+    }
+
+    cache.set(cacheKey, lifeGroup);
+    return lifeGroup;
+  }
+
+  private async linkMemberToImportLifeGroup(
+    member: MemberEntity,
+    lifeGroupName: string | null | undefined,
+    importChurchId: number | null,
+    cache: Map<string, LifeGroupEntity>
+  ) {
+    const trimmed = lifeGroupName?.trim();
+    if (!trimmed) return;
+
+    if (!importChurchId) {
+      throw new BadRequestException(
+        "Lifegroup can only be assigned when using a church import template. Download a church template and fill the Lifegroup column there."
+      );
+    }
+
+    const lifeGroup = await this.findOrCreateLifeGroupForChurch(trimmed, importChurchId, cache);
+    if (!lifeGroup) return;
+
+    await this.ensureLifegroupMembership(member.id, lifeGroup.id);
   }
 
   private async resolveMemberForRegistration(
@@ -590,6 +647,7 @@ export class EventsService {
     const importTagCache = new Map(
       (await this.tagsRepo.find()).map((tag) => [tag.name.toLowerCase(), tag])
     );
+    const importLifeGroupCache = new Map<string, LifeGroupEntity>();
 
     const created: Awaited<ReturnType<EventsService["createEventParticipant"]>>[] = [];
     const errors: { row: number; message: string }[] = [];
@@ -598,6 +656,7 @@ export class EventsService {
       const rowNumber = Number(row?.rowNumber) || 0;
       const firstName = row?.firstName?.trim();
       const lastName = row?.lastName?.trim();
+      const lifeGroupName = row?.lifeGroup?.trim() || "";
 
       if (!firstName || !lastName) {
         errors.push({
@@ -652,6 +711,13 @@ export class EventsService {
             }
           }
 
+          await this.linkMemberToImportLifeGroup(
+            resolvedMember,
+            lifeGroupName,
+            importChurchId,
+            importLifeGroupCache
+          );
+
           if (registeredMemberIds.has(resolvedMember.id)) {
             errors.push({
               row: rowNumber,
@@ -663,6 +729,15 @@ export class EventsService {
           const participant = await this.createEventParticipant(event, resolvedMember);
           registeredMemberIds.add(resolvedMember.id);
           created.push(participant);
+          continue;
+        }
+
+        if (lifeGroupName) {
+          errors.push({
+            row: rowNumber,
+            message:
+              "Lifegroup can only be assigned when using a church import template. Download a church template and fill the Lifegroup column there."
+          });
           continue;
         }
 

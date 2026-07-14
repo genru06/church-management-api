@@ -16,7 +16,7 @@ export class MembersController {
   }
 
   @Get()
-  list(@Query("search") search?: string, @Query("tag") tag?: string) {
+  list(@Query("search") search?: string, @Query("tag") tag?: string | string[]) {
     return this.membersService.list(search, tag);
   }
 
