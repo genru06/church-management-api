@@ -80,6 +80,7 @@ export class MembersService {
     const rows = await qb.getMany();
     const memberIds = rows.map((row) => Number(row.id));
     const tagMap = await this.loadMemberTags(memberIds);
+    const lifeGroupMap = await this.loadMemberLifeGroups(memberIds);
     const pastorChurchByMemberId = await loadPastorChurchesByMemberId(this.churchesRepo, memberIds);
     const cityIds = [...new Set(rows.map((row) => row.cityId).filter(Boolean))];
     const churchIds = [
@@ -97,11 +98,13 @@ export class MembersService {
 
     return rows.map((row) => {
       const churchId = resolveMemberChurchId(row, pastorChurchByMemberId);
+      const lifeGroups = lifeGroupMap.get(Number(row.id)) || [];
       return {
         ...row,
         churchId,
         city: row.cityId ? cityMap.get(row.cityId) || null : null,
         church: churchId ? churchMap.get(churchId) || null : null,
+        lifeGroup: lifeGroups.length ? lifeGroups.join(", ") : null,
         tags: tagMap.get(Number(row.id)) || []
       };
     });
@@ -114,11 +117,13 @@ export class MembersService {
     const pastorChurchByMemberId = await loadPastorChurchesByMemberId(this.churchesRepo, [id]);
     const churchId = resolveMemberChurchId(row, pastorChurchByMemberId);
     const church = churchId ? await this.churchesRepo.findOne({ where: { id: churchId } }) : null;
+    const lifeGroups = (await this.loadMemberLifeGroups([id])).get(Number(id)) || [];
     return {
       ...row,
       churchId,
       city: city?.munCity || null,
       church: church ? getChurchDisplayName(church) : null,
+      lifeGroup: lifeGroups.length ? lifeGroups.join(", ") : null,
       tags: (await this.loadMemberTags([id])).get(Number(id)) || []
     };
   }
@@ -398,6 +403,36 @@ export class MembersService {
       [tagName]
     );
     return rows.map((row: { id: string | number }) => Number(row.id));
+  }
+
+  private async loadMemberLifeGroups(memberIds: number[]) {
+    const map = new Map<number, string[]>();
+    if (!memberIds.length) return map;
+
+    const placeholders = memberIds.map(() => "?").join(",");
+    const rows = await this.membersRepo.query(
+      `SELECT memberId, name FROM (
+         SELECT lm.member_id AS memberId, lg.lifegroup_name AS name
+         FROM lifegroup_member lm
+         INNER JOIN lifegroup lg ON lg.id = lm.lifegroup_id
+         WHERE lm.member_id IN (${placeholders})
+         UNION
+         SELECT lg.coach_member_id AS memberId, lg.lifegroup_name AS name
+         FROM lifegroup lg
+         WHERE lg.coach_member_id IN (${placeholders})
+       ) linked
+       ORDER BY name ASC`,
+      [...memberIds, ...memberIds]
+    );
+
+    rows.forEach((row: { memberId: string | number; name: string }) => {
+      const memberId = Number(row.memberId);
+      if (!row.name) return;
+      const existing = map.get(memberId) || [];
+      if (!existing.includes(row.name)) existing.push(row.name);
+      map.set(memberId, existing);
+    });
+    return map;
   }
 
   private async loadMemberTags(memberIds: number[]) {
