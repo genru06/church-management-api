@@ -32,6 +32,7 @@ import { MemberEntity } from "../entities/member.entity";
 import { MemberTagEntity } from "../entities/member-tag.entity";
 import { TagEntity } from "../entities/tag.entity";
 import { ChurchEntity } from "../entities/church.entity";
+import { ChurchTagEntity } from "../entities/church-tag.entity";
 import { LifeGroupEntity } from "../entities/lifegroup.entity";
 import { LifeGroupMemberEntity } from "../entities/lifegroup-member.entity";
 import { AttendanceEntity } from "../entities/attendance.entity";
@@ -52,6 +53,7 @@ const entities = [
   MemberTagEntity,
   TagEntity,
   ChurchEntity,
+  ChurchTagEntity,
   LifeGroupEntity,
   LifeGroupMemberEntity,
   AttendanceEntity,

@@ -1,14 +1,18 @@
-import { Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
 import { Repository } from "typeorm";
 import { ChurchEntity } from "../../entities/church.entity";
+import { ChurchTagEntity } from "../../entities/church-tag.entity";
 import { MemberEntity } from "../../entities/member.entity";
 import { LifeGroupEntity } from "../../entities/lifegroup.entity";
+import { TagEntity } from "../../entities/tag.entity";
 
 @Injectable()
 export class ChurchesService {
   constructor(
     @InjectRepository(ChurchEntity) private readonly churchesRepo: Repository<ChurchEntity>,
+    @InjectRepository(ChurchTagEntity) private readonly churchTagsRepo: Repository<ChurchTagEntity>,
+    @InjectRepository(TagEntity) private readonly tagsRepo: Repository<TagEntity>,
     @InjectRepository(MemberEntity) private readonly membersRepo: Repository<MemberEntity>,
     @InjectRepository(LifeGroupEntity) private readonly lifeGroupsRepo: Repository<LifeGroupEntity>
   ) {}
@@ -26,16 +30,19 @@ export class ChurchesService {
     if (pastorMemberId) {
       await this.membersRepo.update(pastorMemberId, { churchId: saved.id });
     }
-    return this.view(saved.id);
+    await this.setChurchTags(Number(saved.id), body.tags);
+    return this.view(Number(saved.id));
   }
 
   async list() {
     const rows = await this.churchesRepo.find({ order: { id: "DESC" } });
     const members = await this.membersRepo.find();
     const nameById = new Map(members.map((m) => [m.id, `${m.firstName} ${m.lastName}`]));
+    const tagMap = await this.loadChurchTags(rows.map((c) => Number(c.id)));
     return rows.map((c) => ({
       ...c,
-      pastorName: c.pastorMemberId ? nameById.get(c.pastorMemberId) || "-" : "-"
+      pastorName: c.pastorMemberId ? nameById.get(c.pastorMemberId) || "-" : "-",
+      tags: tagMap.get(Number(c.id)) || []
     }));
   }
 
@@ -48,7 +55,12 @@ export class ChurchesService {
       if (pastor) pastorName = `${pastor.firstName} ${pastor.lastName}`;
     }
     const stats = await this.loadStats(id);
-    return { ...row, pastorName, stats };
+    return {
+      ...row,
+      pastorName,
+      stats,
+      tags: (await this.loadChurchTags([id])).get(Number(id)) || []
+    };
   }
 
   async listMembers(id: number) {
@@ -268,13 +280,117 @@ export class ChurchesService {
     if (pastorMemberId) {
       await this.membersRepo.update(pastorMemberId, { churchId: id });
     }
-    return this.view(id);
+    if (body?.tags !== undefined) {
+      await this.setChurchTags(Number(id), body.tags);
+    }
+    return this.view(Number(id));
   }
 
   async remove(id: number) {
     const existing = await this.churchesRepo.findOne({ where: { id } });
     if (!existing) throw new NotFoundException("Church not found");
+    try {
+      await this.churchesRepo.query(`DELETE FROM church_tag WHERE church_id = ?`, [Number(id)]);
+    } catch (err: any) {
+      if (err?.code !== "ER_NO_SUCH_TABLE") throw err;
+    }
     await this.churchesRepo.delete(id);
     return { id, deleted: true };
+  }
+
+  private normalizeTagNames(value: unknown): string[] {
+    if (!Array.isArray(value)) return [];
+    const seen = new Set<string>();
+    const names: string[] = [];
+    for (const tag of value) {
+      const name = String(tag || "").trim();
+      if (!name) continue;
+      const key = name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      names.push(name);
+    }
+    return names;
+  }
+
+  private async resolveTagsByNames(tagNames: string[]): Promise<TagEntity[]> {
+    const resolved: TagEntity[] = [];
+    const seenIds = new Set<number>();
+
+    for (const name of tagNames) {
+      const tag = await this.tagsRepo
+        .createQueryBuilder("tag")
+        .where("LOWER(tag.name) = LOWER(:name)", { name })
+        .getOne();
+      if (!tag) throw new BadRequestException(`Unknown tag: ${name}`);
+      const tagId = Number(tag.id);
+      if (seenIds.has(tagId)) continue;
+      seenIds.add(tagId);
+      resolved.push(tag);
+    }
+
+    return resolved;
+  }
+
+  private async setChurchTags(churchId: number, value: unknown) {
+    const id = Number(churchId);
+    if (!Number.isFinite(id) || id <= 0) {
+      throw new BadRequestException("Invalid church id for tags");
+    }
+
+    const tagNames = this.normalizeTagNames(value);
+    const tags = tagNames.length ? await this.resolveTagsByNames(tagNames) : [];
+
+    try {
+      await this.churchesRepo.query(`DELETE FROM church_tag WHERE church_id = ?`, [id]);
+      if (!tags.length) return;
+
+      const valuesSql = tags.map(() => "(?, ?)").join(", ");
+      const params = tags.flatMap((tag) => [id, Number(tag.id)]);
+      await this.churchesRepo.query(
+        `INSERT INTO church_tag (church_id, tag_id) VALUES ${valuesSql}`,
+        params
+      );
+    } catch (err: any) {
+      if (err?.code === "ER_NO_SUCH_TABLE") {
+        throw new BadRequestException(
+          "church_tag table is missing. Run database/church-tags-migration.sql on the database."
+        );
+      }
+      throw err;
+    }
+  }
+
+  private async loadChurchTags(churchIds: number[]) {
+    const map = new Map<number, string[]>();
+    const ids = [...new Set(churchIds.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0))];
+    if (!ids.length) return map;
+
+    try {
+      const placeholders = ids.map(() => "?").join(", ");
+      const rows: { churchId: string | number; name: string }[] = await this.churchesRepo.query(
+        `SELECT ct.church_id AS churchId, t.name AS name
+         FROM church_tag ct
+         INNER JOIN tag t ON t.id = ct.tag_id
+         WHERE ct.church_id IN (${placeholders})
+         ORDER BY t.name ASC`,
+        ids
+      );
+
+      rows.forEach((row) => {
+        const churchId = Number(row.churchId);
+        const existing = map.get(churchId) || [];
+        existing.push(row.name);
+        map.set(churchId, existing);
+      });
+      return map;
+    } catch (err: any) {
+      if (err?.code === "ER_NO_SUCH_TABLE") {
+        throw new BadRequestException(
+          "church_tag table is missing. Run database/church-tags-migration.sql on the database."
+        );
+      }
+      throw err;
+    }
   }
 }
