@@ -13,6 +13,7 @@ import {
   findMemberDuplicate,
   registerMemberDuplicateName
 } from "../../utils/member-duplicate";
+import { generateQrToken } from "../../utils/qr-token";
 
 export const MEMBER_BULK_TEMPLATE_SIGNATURE = "LIFEGROUP_MEMBER_BULK_V1";
 export const MEMBER_BULK_TEMPLATE_SIGNATURE_V2 = "LIFEGROUP_MEMBER_BULK_V2";
@@ -54,7 +55,8 @@ export class MembersService {
         gender: body.gender?.trim() || "",
         maritalStatus: body.maritalStatus || null,
         nationality: body.nationality || null,
-        churchId
+        churchId,
+        qrToken: generateQrToken()
       })
     );
     await this.setMemberTags(saved.id, body.tags);
@@ -113,13 +115,14 @@ export class MembersService {
   async view(id: number) {
     const row = await this.membersRepo.findOne({ where: { id } });
     if (!row) throw new NotFoundException("Member not found");
-    const city = row.cityId ? await this.citiesRepo.findOne({ where: { id: row.cityId } }) : null;
+    const member = await this.ensureQrToken(row);
+    const city = member.cityId ? await this.citiesRepo.findOne({ where: { id: member.cityId } }) : null;
     const pastorChurchByMemberId = await loadPastorChurchesByMemberId(this.churchesRepo, [id]);
-    const churchId = resolveMemberChurchId(row, pastorChurchByMemberId);
+    const churchId = resolveMemberChurchId(member, pastorChurchByMemberId);
     const church = churchId ? await this.churchesRepo.findOne({ where: { id: churchId } }) : null;
     const lifeGroups = (await this.loadMemberLifeGroups([id])).get(Number(id)) || [];
     return {
-      ...row,
+      ...member,
       churchId,
       city: city?.munCity || null,
       church: church ? getChurchDisplayName(church) : null,
@@ -247,7 +250,8 @@ export class MembersService {
             gender: row.gender?.trim() || "",
             maritalStatus: row.maritalStatus?.trim() || null,
             nationality: row.nationality?.trim() || null,
-            churchId: importChurchId
+            churchId: importChurchId,
+            qrToken: generateQrToken()
           })
         );
         if (tagNames.length) {
@@ -277,6 +281,13 @@ export class MembersService {
     const church = await this.churchesRepo.findOne({ where: { id: Number(churchId) } });
     if (!church) throw new BadRequestException("Church not found");
     return church.id;
+  }
+
+  private async ensureQrToken(member: MemberEntity) {
+    if (member.qrToken) return member;
+    const qrToken = generateQrToken();
+    await this.membersRepo.update(member.id, { qrToken });
+    return { ...member, qrToken };
   }
 
   private async resolveCityId(cityName?: string) {

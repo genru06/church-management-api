@@ -46,4 +46,7 @@ export class MemberEntity {
 
   @Column({ name: "church_id", type: "bigint", unsigned: true, nullable: true })
   churchId: number | null;
+
+  @Column({ name: "qr_token", type: "varchar", length: 64, unique: true })
+  qrToken: string;
 }

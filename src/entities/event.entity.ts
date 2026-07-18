@@ -47,6 +47,9 @@ export class EventEntity {
   @Column({ name: "allow_pledges", type: "boolean", default: false })
   allowPledges: boolean;
 
+  @Column({ name: "requires_pre_registration", type: "boolean", default: false })
+  requiresPreRegistration: boolean;
+
   @CreateDateColumn({ name: "created_at" })
   createdAt: Date;
 

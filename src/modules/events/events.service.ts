@@ -1,6 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
-import { randomUUID } from "crypto";
 import { In, Repository } from "typeorm";
 import { EventEntity } from "../../entities/event.entity";
 import { EventParticipantEntity } from "../../entities/event-participant.entity";
@@ -14,6 +13,7 @@ import { MemberTagEntity } from "../../entities/member-tag.entity";
 import { TagEntity } from "../../entities/tag.entity";
 import { getChurchDisplayName } from "../../utils/church-display";
 import { loadPastorChurchesByMemberId, resolveMemberChurchId } from "../../utils/member-church";
+import { generateQrToken } from "../../utils/qr-token";
 
 export const EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE_V2 = "LIFEGROUP_EVENT_PARTICIPANT_BULK_V2";
 export const EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE = "LIFEGROUP_EVENT_PARTICIPANT_BULK_V3";
@@ -98,6 +98,7 @@ export class EventsService {
       contactPerson: row.contactPerson,
       contactEmail: row.contactEmail,
       allowPledges: row.allowPledges,
+      requiresPreRegistration: row.requiresPreRegistration,
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
       createdBy: row.createdBy,
@@ -340,7 +341,8 @@ export class EventsService {
           email: null,
           phone: null,
           gender: "",
-          churchId
+          churchId,
+          qrToken: generateQrToken()
         })
       );
       isNewMember = true;
@@ -386,7 +388,7 @@ export class EventsService {
         fullName: `${member.firstName} ${member.lastName}`,
         email: member.email,
         phone: member.phone,
-        qrToken: randomUUID().replace(/-/g, ""),
+        qrToken: generateQrToken(),
         registrationPaid: false,
         registrationAmount: event.registrationFee && Number(event.registrationFee) > 0 ? event.registrationFee : null
       })
@@ -409,7 +411,7 @@ export class EventsService {
         fullName,
         email: body.email?.trim() || null,
         phone: body.phone?.trim() || null,
-        qrToken: randomUUID().replace(/-/g, ""),
+        qrToken: generateQrToken(),
         registrationPaid: false,
         registrationAmount: event.registrationFee && Number(event.registrationFee) > 0 ? event.registrationFee : null
       })
@@ -467,6 +469,10 @@ export class EventsService {
       contactPerson: body.contactPerson !== undefined ? body.contactPerson || null : existing?.contactPerson ?? null,
       contactEmail: body.contactEmail !== undefined ? body.contactEmail || null : existing?.contactEmail ?? null,
       allowPledges: body.allowPledges !== undefined ? !!body.allowPledges : existing?.allowPledges ?? false,
+      requiresPreRegistration:
+        body.requiresPreRegistration !== undefined
+          ? !!body.requiresPreRegistration
+          : existing?.requiresPreRegistration ?? false,
       createdBy: existing?.createdBy ?? (body.createdBy ? Number(body.createdBy) : null),
       updatedBy: body.updatedBy ? Number(body.updatedBy) : existing?.updatedBy ?? null
     };
@@ -692,7 +698,8 @@ export class EventsService {
                 email: null,
                 phone: row.phone?.trim() || null,
                 gender: "",
-                churchId: importChurchId
+                churchId: importChurchId,
+                qrToken: generateQrToken()
               })
             );
             if (tagNames.length) {
@@ -884,21 +891,62 @@ export class EventsService {
   }
 
   async checkIn(eventId: number, body: any) {
-    await this.getEventOrFail(eventId);
-    const participantId = Number(body.participantId);
+    const event = await this.getEventOrFail(eventId);
     const token = body.token?.trim();
+    if (!token) throw new BadRequestException("Invalid check-in payload");
 
-    if (!participantId || !token) throw new BadRequestException("Invalid check-in payload");
+    // Member identity QR (works across all events)
+    if (body.type === "member" || body.memberId) {
+      return this.checkInByMemberQr(event, Number(body.memberId), token);
+    }
+
+    // Legacy / guest participant QR (scoped to one registration)
+    const participantId = Number(body.participantId);
+    if (!participantId) throw new BadRequestException("Invalid check-in payload");
 
     const participant = await this.participantsRepo.findOne({ where: { id: participantId, eventId } });
     if (!participant) throw new NotFoundException("Participant not found");
     if (participant.qrToken !== token) throw new BadRequestException("Invalid QR token");
+    return this.markParticipantAttended(participant);
+  }
+
+  private async checkInByMemberQr(event: EventEntity, memberId: number, token: string) {
+    if (!Number.isFinite(memberId) || memberId <= 0) {
+      throw new BadRequestException("Invalid check-in payload");
+    }
+
+    const member = await this.membersRepo.findOne({ where: { id: memberId } });
+    if (!member) throw new NotFoundException("Member not found");
+    if (!member.qrToken || member.qrToken !== token) {
+      throw new BadRequestException("Invalid QR token");
+    }
+
+    let participant = await this.participantsRepo.findOne({
+      where: { eventId: event.id, memberId: member.id }
+    });
+
+    if (!participant) {
+      if (event.requiresPreRegistration) {
+        throw new BadRequestException({
+          code: "NOT_REGISTERED",
+          message: `This member is not registered to attend this ${event.name}.`
+        });
+      }
+      const created = await this.createEventParticipant(event, member);
+      participant = await this.participantsRepo.findOne({ where: { id: created.id } });
+      if (!participant) throw new NotFoundException("Participant not found");
+    }
+
+    return this.markParticipantAttended(participant);
+  }
+
+  private async markParticipantAttended(participant: EventParticipantEntity) {
     if (participant.attendedAt) {
       return { ...this.mapParticipant(participant), alreadyCheckedIn: true };
     }
 
-    await this.participantsRepo.update(participantId, { attendedAt: new Date() });
-    const updated = await this.participantsRepo.findOne({ where: { id: participantId } });
+    await this.participantsRepo.update(participant.id, { attendedAt: new Date() });
+    const updated = await this.participantsRepo.findOne({ where: { id: participant.id } });
     return { ...this.mapParticipant(updated!), alreadyCheckedIn: false };
   }
 
