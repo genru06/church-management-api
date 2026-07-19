@@ -121,6 +121,7 @@ export class EventsService {
       lifegroupId?: number | null;
       churchName?: string | null;
       lifegroupName?: string | null;
+      memberQrToken?: string | null;
     } = {}
   ) {
     return {
@@ -137,6 +138,7 @@ export class EventsService {
       email: extras.email ?? row.email,
       phone: extras.phone ?? row.phone,
       qrToken: row.qrToken,
+      memberQrToken: extras.memberQrToken ?? null,
       attendedAt: row.attendedAt,
       registrationPaid: row.registrationPaid,
       registrationAmount: row.registrationAmount ? Number(row.registrationAmount) : null,
@@ -148,7 +150,7 @@ export class EventsService {
   private async enrichParticipants(rows: EventParticipantEntity[]) {
     const memberIds = [...new Set(rows.map((r) => r.memberId).filter(Boolean) as number[])];
     const members = memberIds.length ? await this.membersRepo.find({ where: { id: In(memberIds) } }) : [];
-    const memberById = new Map(members.map((m) => [m.id, m]));
+    const memberById = new Map(members.map((m) => [Number(m.id), m]));
 
     const links = memberIds.length
       ? await this.lifeGroupMembersRepo.find({ where: { memberId: In(memberIds) } })
@@ -192,8 +194,8 @@ export class EventsService {
     }
 
     return rows.map((row) => {
-      const member = row.memberId ? memberById.get(row.memberId) : null;
-      const lifegroup = row.memberId ? lifegroupByMemberId.get(row.memberId) : null;
+      const member = row.memberId ? memberById.get(Number(row.memberId)) : null;
+      const lifegroup = row.memberId ? lifegroupByMemberId.get(Number(row.memberId)) : null;
       const churchId = member
         ? resolveMemberChurchId(member, pastorChurchByMemberId) ?? lifegroup?.churchId ?? null
         : null;
@@ -208,7 +210,8 @@ export class EventsService {
           churchId,
           lifegroupId: lifegroup?.id ?? null,
           churchName: churchId ? churchNameById.get(churchId) || null : null,
-          lifegroupName: lifegroup?.name ?? null
+          lifegroupName: lifegroup?.name ?? null,
+          memberQrToken: member?.qrToken ?? null
         }),
         memberLinked: !!row.memberId
       };
