@@ -235,7 +235,8 @@ export class EventsService {
 
     const lifegroup = await this.lifeGroupsRepo.findOne({ where: { id: lifegroupId } });
     if (!lifegroup) throw new NotFoundException("LifeGroup not found");
-    if (lifegroup.churchId && lifegroup.churchId !== churchId) {
+    // bigint columns come back as strings from the driver — compare numerically
+    if (lifegroup.churchId != null && Number(lifegroup.churchId) !== Number(churchId)) {
       throw new BadRequestException("Selected LifeGroup does not belong to the selected church.");
     }
   }
