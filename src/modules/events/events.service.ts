@@ -16,10 +16,12 @@ import { loadPastorChurchesByMemberId, resolveMemberChurchId } from "../../utils
 import { generateQrToken } from "../../utils/qr-token";
 
 export const EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE_V2 = "LIFEGROUP_EVENT_PARTICIPANT_BULK_V2";
-export const EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE = "LIFEGROUP_EVENT_PARTICIPANT_BULK_V3";
+export const EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE_V3 = "LIFEGROUP_EVENT_PARTICIPANT_BULK_V3";
+export const EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE = "LIFEGROUP_EVENT_PARTICIPANT_BULK_V4";
 
 const VALID_EVENT_PARTICIPANT_BULK_SIGNATURES = new Set([
   EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE_V2,
+  EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE_V3,
   EVENT_PARTICIPANT_BULK_TEMPLATE_SIGNATURE
 ]);
 
@@ -310,21 +312,34 @@ export class EventsService {
     member: MemberEntity,
     lifeGroupName: string | null | undefined,
     importChurchId: number | null,
-    cache: Map<string, LifeGroupEntity>
+    cache: Map<string, LifeGroupEntity>,
+    importLifeGroupId: number | null = null
   ) {
     const trimmed = lifeGroupName?.trim();
-    if (!trimmed) return;
+
+    if (trimmed) {
+      if (!importChurchId) {
+        throw new BadRequestException(
+          "Lifegroup can only be assigned when using a church import template. Download a church template and fill the Lifegroup column there."
+        );
+      }
+
+      const lifeGroup = await this.findOrCreateLifeGroupForChurch(trimmed, importChurchId, cache);
+      if (!lifeGroup) return;
+
+      await this.ensureLifegroupMembership(member.id, lifeGroup.id);
+      return;
+    }
+
+    if (!importLifeGroupId) return;
 
     if (!importChurchId) {
       throw new BadRequestException(
-        "Lifegroup can only be assigned when using a church import template. Download a church template and fill the Lifegroup column there."
+        "Lifegroup can only be assigned when using a church import template. Download a church template and select a lifegroup there."
       );
     }
 
-    const lifeGroup = await this.findOrCreateLifeGroupForChurch(trimmed, importChurchId, cache);
-    if (!lifeGroup) return;
-
-    await this.ensureLifegroupMembership(member.id, lifeGroup.id);
+    await this.ensureLifegroupMembership(member.id, importLifeGroupId);
   }
 
   private async resolveMemberForRegistration(
@@ -607,6 +622,7 @@ export class EventsService {
       signature?: string;
       eventId?: number | string;
       churchId?: number | string | null;
+      lifeGroupId?: number | string | null;
       participants?: any[];
     }
   ) {
@@ -638,6 +654,20 @@ export class EventsService {
       if (!importChurchId) {
         throw new BadRequestException("The church identifier in this template is invalid.");
       }
+    }
+
+    let importLifeGroupId: number | null = null;
+    if (body.lifeGroupId != null && body.lifeGroupId !== "") {
+      if (!importChurchId) {
+        throw new BadRequestException(
+          "Lifegroup can only be assigned when using a church import template. Download a church template and select a lifegroup there."
+        );
+      }
+      importLifeGroupId = Number(body.lifeGroupId);
+      if (!importLifeGroupId || Number.isNaN(importLifeGroupId)) {
+        throw new BadRequestException("The lifegroup identifier in this template is invalid.");
+      }
+      await this.validateChurchAndLifeGroup(importChurchId, importLifeGroupId);
     }
 
     const existingParticipants = await this.participantsRepo.find({
@@ -725,7 +755,8 @@ export class EventsService {
             resolvedMember,
             lifeGroupName,
             importChurchId,
-            importLifeGroupCache
+            importLifeGroupCache,
+            importLifeGroupId
           );
 
           if (registeredMemberIds.has(resolvedMember.id)) {
