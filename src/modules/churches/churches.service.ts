@@ -6,6 +6,7 @@ import { ChurchTagEntity } from "../../entities/church-tag.entity";
 import { MemberEntity } from "../../entities/member.entity";
 import { LifeGroupEntity } from "../../entities/lifegroup.entity";
 import { TagEntity } from "../../entities/tag.entity";
+import { sortChurchesMainFirst } from "../../utils/church-display";
 
 @Injectable()
 export class ChurchesService {
@@ -39,11 +40,13 @@ export class ChurchesService {
     const members = await this.membersRepo.find();
     const nameById = new Map(members.map((m) => [m.id, `${m.firstName} ${m.lastName}`]));
     const tagMap = await this.loadChurchTags(rows.map((c) => Number(c.id)));
-    return rows.map((c) => ({
-      ...c,
-      pastorName: c.pastorMemberId ? nameById.get(c.pastorMemberId) || "-" : "-",
-      tags: tagMap.get(Number(c.id)) || []
-    }));
+    return sortChurchesMainFirst(
+      rows.map((c) => ({
+        ...c,
+        pastorName: c.pastorMemberId ? nameById.get(c.pastorMemberId) || "-" : "-",
+        tags: tagMap.get(Number(c.id)) || []
+      }))
+    );
   }
 
   async view(id: number) {
