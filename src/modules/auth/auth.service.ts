@@ -7,12 +7,14 @@ import { UserEntity } from "../../entities/user.entity";
 import { UserAccessTagEntity } from "../../entities/user-access-tag.entity";
 import { UserTagEntity } from "../../entities/user-tag.entity";
 import { AuthUser } from "../../shared/permissions";
+import { AclService } from "../acl/acl.service";
 
 @Injectable()
 export class AuthService {
   constructor(
     @InjectRepository(UserEntity) private readonly usersRepo: Repository<UserEntity>,
-    @InjectRepository(UserTagEntity) private readonly userTagsRepo: Repository<UserTagEntity>
+    @InjectRepository(UserTagEntity) private readonly userTagsRepo: Repository<UserTagEntity>,
+    private readonly aclService: AclService
   ) {}
 
   private async loadUserTags(userId: number): Promise<string[]> {
@@ -25,12 +27,14 @@ export class AuthService {
     return rows.map((r) => r.name);
   }
 
-  private buildAuthUser(user: UserEntity, tags: string[]): AuthUser {
+  private async buildAuthUser(user: UserEntity, tags: string[]): Promise<AuthUser> {
+    const permissions = await this.aclService.resolvePermissionsForTags(tags);
     return {
       id: user.id,
       fullName: user.fullName,
       username: user.username,
       tags,
+      permissions,
       churchId: user.churchId,
       memberId: user.memberId
     };
@@ -38,7 +42,9 @@ export class AuthService {
 
   private signToken(user: AuthUser): string {
     const secret = process.env.JWT_SECRET || "change-this-secret";
-    return jwt.sign(user, secret, { expiresIn: "8h" });
+    // Keep JWT lean — permissions are refreshed via /auth/me and login payload
+    const { permissions: _permissions, ...tokenUser } = user;
+    return jwt.sign(tokenUser, secret, { expiresIn: "8h" });
   }
 
   async login(body: any) {
@@ -51,9 +57,11 @@ export class AuthService {
     if (!valid) throw new UnauthorizedException("Invalid credentials");
 
     const tags = await this.loadUserTags(user.id);
-    if (!tags.length) throw new UnauthorizedException("Your account has no access tags assigned. Contact an administrator.");
+    if (!tags.length) {
+      throw new UnauthorizedException("Your account has no access tags assigned. Contact an administrator.");
+    }
 
-    const authUser = this.buildAuthUser(user, tags);
+    const authUser = await this.buildAuthUser(user, tags);
     const token = this.signToken(authUser);
     return { token, user: authUser };
   }

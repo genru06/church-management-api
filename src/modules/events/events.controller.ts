@@ -28,6 +28,22 @@ export class EventsController {
     return this.eventsService.publicSignup(Number(id), body);
   }
 
+  @Public()
+  @Get(":id/register/:participantId")
+  getPublicRegistration(@Param("id") id: string, @Param("participantId") participantId: string) {
+    return this.eventsService.getPublicRegistration(Number(id), Number(participantId));
+  }
+
+  @Public()
+  @Post(":id/register/:participantId/pay")
+  publicPayRegistration(
+    @Param("id") id: string,
+    @Param("participantId") participantId: string,
+    @Body() body: any
+  ) {
+    return this.eventsService.publicPayRegistration(Number(id), Number(participantId), body);
+  }
+
   @Get(":id/dashboard")
   dashboard(@Param("id") id: string) {
     return this.eventsService.dashboard(Number(id));

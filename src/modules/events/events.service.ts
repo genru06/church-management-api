@@ -11,7 +11,7 @@ import { LifeGroupEntity } from "../../entities/lifegroup.entity";
 import { LifeGroupMemberEntity } from "../../entities/lifegroup-member.entity";
 import { MemberTagEntity } from "../../entities/member-tag.entity";
 import { TagEntity } from "../../entities/tag.entity";
-import { getChurchDisplayName } from "../../utils/church-display";
+import { getChurchDisplayName, sortChurchesMainFirst } from "../../utils/church-display";
 import { loadPastorChurchesByMemberId, resolveMemberChurchId } from "../../utils/member-church";
 import { generateQrToken } from "../../utils/qr-token";
 
@@ -1135,13 +1135,64 @@ export class EventsService {
     };
   }
 
+  private async loadSignupOptions() {
+    const churches = await this.churchesRepo.find({ order: { id: "DESC" } });
+    const lifegroups = await this.lifeGroupsRepo.find({ order: { id: "DESC" } });
+    return {
+      churches: sortChurchesMainFirst(
+        churches.map((church) => ({
+          id: church.id,
+          name: getChurchDisplayName(church)
+        }))
+      ),
+      lifegroups: lifegroups.map((group) => ({
+        id: group.id,
+        name: group.name,
+        churchId: group.churchId
+      }))
+    };
+  }
+
   async getSignupInfo(eventId: number) {
     const event = await this.getEventOrFail(eventId);
     const registration = this.getRegistrationStatus(event);
+    const options = await this.loadSignupOptions();
     return {
       event: this.mapEvent(event),
-      ...registration
+      ...registration,
+      ...options
     };
+  }
+
+  async getPublicRegistration(eventId: number, participantId: number) {
+    const event = await this.getEventOrFail(eventId);
+    const fee = Number(event.registrationFee || 0);
+    if (fee <= 0) throw new BadRequestException("This event has no registration fee");
+
+    const participant = await this.participantsRepo.findOne({ where: { id: participantId, eventId } });
+    if (!participant) throw new NotFoundException("Registration not found");
+
+    const [enriched] = await this.enrichParticipants([participant]);
+    return {
+      event: {
+        id: event.id,
+        name: event.name,
+        eventDate: event.eventDate,
+        eventTime: this.normalizeEventTime(event.eventTime),
+        location: event.location,
+        registrationFee: fee
+      },
+      participant: {
+        id: enriched.id,
+        fullName: enriched.fullName,
+        registrationPaid: enriched.registrationPaid,
+        registrationAmount: enriched.registrationAmount
+      }
+    };
+  }
+
+  async publicPayRegistration(eventId: number, participantId: number, body: any) {
+    return this.payRegistration(eventId, participantId, body);
   }
 
   async publicSignup(eventId: number, body: any) {

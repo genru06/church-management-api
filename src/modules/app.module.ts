@@ -25,6 +25,10 @@ import { UsersController } from "../modules/users/users.controller";
 import { UsersService } from "../modules/users/users.service";
 import { TagsController } from "../modules/tags/tags.controller";
 import { TagsService } from "../modules/tags/tags.service";
+import { AclResourceEntity } from "../entities/acl-resource.entity";
+import { TagAclEntity } from "../entities/tag-acl.entity";
+import { AclController } from "../modules/acl/acl.controller";
+import { AclService } from "../modules/acl/acl.service";
 import { UserEntity } from "../entities/user.entity";
 import { UserAccessTagEntity } from "../entities/user-access-tag.entity";
 import { UserTagEntity } from "../entities/user-tag.entity";
@@ -49,6 +53,8 @@ const entities = [
   UserEntity,
   UserAccessTagEntity,
   UserTagEntity,
+  AclResourceEntity,
+  TagAclEntity,
   MemberEntity,
   MemberTagEntity,
   TagEntity,
@@ -93,7 +99,8 @@ const entities = [
     EventsController,
     OperationsController,
     UsersController,
-    TagsController
+    TagsController,
+    AclController
   ],
   providers: [
     { provide: APP_GUARD, useClass: AuthGuard },
@@ -107,7 +114,8 @@ const entities = [
     EventsService,
     OperationsService,
     UsersService,
-    TagsService
+    TagsService,
+    AclService
   ]
 })
 export class AppModule {}
