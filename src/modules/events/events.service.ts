@@ -149,10 +149,38 @@ export class EventsService {
     };
   }
 
+  private async loadMemberTagsByMemberId(memberIds: number[]) {
+    const map = new Map<number, string[]>();
+    if (!memberIds.length) return map;
+
+    const memberTags = await this.memberTagsRepo.find({ where: { memberId: In(memberIds) } });
+    if (!memberTags.length) return map;
+
+    const tagIds = [...new Set(memberTags.map((row) => Number(row.tagId)))];
+    const tags = tagIds.length ? await this.tagsRepo.find({ where: { id: In(tagIds) } }) : [];
+    const tagNameById = new Map(tags.map((tag) => [Number(tag.id), tag.name]));
+
+    for (const row of memberTags) {
+      const memberId = Number(row.memberId);
+      const tagName = tagNameById.get(Number(row.tagId));
+      if (!tagName) continue;
+      const existing = map.get(memberId) || [];
+      existing.push(tagName);
+      map.set(memberId, existing);
+    }
+
+    return map;
+  }
+
+  private isKidsTagged(tags: string[] = []) {
+    return tags.some((tag) => String(tag || "").trim().toLowerCase() === "kids");
+  }
+
   private async enrichParticipants(rows: EventParticipantEntity[]) {
     const memberIds = [...new Set(rows.map((r) => r.memberId).filter(Boolean) as number[])];
     const members = memberIds.length ? await this.membersRepo.find({ where: { id: In(memberIds) } }) : [];
     const memberById = new Map(members.map((m) => [Number(m.id), m]));
+    const tagsByMemberId = await this.loadMemberTagsByMemberId(memberIds);
 
     const links = memberIds.length
       ? await this.lifeGroupMembersRepo.find({ where: { memberId: In(memberIds) } })
@@ -195,29 +223,45 @@ export class EventsService {
       }
     }
 
-    return rows.map((row) => {
-      const member = row.memberId ? memberById.get(Number(row.memberId)) : null;
-      const lifegroup = row.memberId ? lifegroupByMemberId.get(Number(row.memberId)) : null;
-      const churchId = member
-        ? resolveMemberChurchId(member, pastorChurchByMemberId) ?? lifegroup?.churchId ?? null
-        : null;
+    return rows
+      .map((row) => {
+        const member = row.memberId ? memberById.get(Number(row.memberId)) : null;
+        const lifegroup = row.memberId ? lifegroupByMemberId.get(Number(row.memberId)) : null;
+        const churchId = member
+          ? resolveMemberChurchId(member, pastorChurchByMemberId) ?? lifegroup?.churchId ?? null
+          : null;
+        const tags = row.memberId ? tagsByMemberId.get(Number(row.memberId)) || [] : [];
+        const isKid = this.isKidsTagged(tags);
 
-      return {
-        ...this.mapParticipant(row, {
-          firstName: member?.firstName ?? null,
-          lastName: member?.lastName ?? null,
-          fullName: member ? `${member.firstName} ${member.lastName}` : row.fullName,
-          email: member?.email ?? row.email,
-          phone: member?.phone ?? row.phone,
-          churchId,
-          lifegroupId: lifegroup?.id ?? null,
-          churchName: churchId ? churchNameById.get(churchId) || null : null,
-          lifegroupName: lifegroup?.name ?? null,
-          memberQrToken: member?.qrToken ?? null
-        }),
-        memberLinked: !!row.memberId
-      };
-    });
+        return {
+          ...this.mapParticipant(row, {
+            firstName: member?.firstName ?? null,
+            lastName: member?.lastName ?? null,
+            fullName: member ? `${member.firstName} ${member.lastName}` : row.fullName,
+            email: member?.email ?? row.email,
+            phone: member?.phone ?? row.phone,
+            churchId,
+            lifegroupId: lifegroup?.id ?? null,
+            churchName: churchId ? churchNameById.get(churchId) || null : null,
+            lifegroupName: lifegroup?.name ?? null,
+            memberQrToken: member?.qrToken ?? null
+          }),
+          tags,
+          isKid,
+          memberLinked: !!row.memberId
+        };
+      })
+      .sort((a, b) => {
+        const last = String(a.lastName || a.fullName || "").localeCompare(
+          String(b.lastName || b.fullName || ""),
+          undefined,
+          { sensitivity: "base" }
+        );
+        if (last !== 0) return last;
+        return String(a.firstName || "").localeCompare(String(b.firstName || ""), undefined, {
+          sensitivity: "base"
+        });
+      });
   }
 
   private async assertRegistrationOpen(event: EventEntity) {
@@ -1064,6 +1108,8 @@ export class EventsService {
     const pledges = event.allowPledges ? await this.listPledges(eventId) : [];
 
     const attendedCount = participants.filter((p) => p.attendedAt).length;
+    const kidsCount = participants.filter((p) => p.isKid).length;
+    const adultCount = participants.length - kidsCount;
     const registrationCollected = participants
       .filter((p) => p.registrationPaid)
       .reduce((sum, p) => sum + (p.registrationAmount || 0), 0);
@@ -1076,6 +1122,8 @@ export class EventsService {
       pledges,
       stats: {
         participantCount: participants.length,
+        adultCount,
+        kidsCount,
         expectedParticipants: event.expectedParticipants || 0,
         attendedCount,
         attendanceRate: participants.length ? Math.round((attendedCount / participants.length) * 100) : 0,

@@ -44,13 +44,19 @@ export class LifeGroupsService {
     const links = await this.lifeGroupMembersRepo.find({ where: { lifeGroupId: id } });
     const ids = links.map((l) => l.memberId);
     const linkedMembers = ids.length ? await this.membersRepo.findBy(ids.map((memberId) => ({ id: memberId }))) : [];
-    const memberNameById = new Map(linkedMembers.map((m) => [m.id, `${m.firstName} ${m.lastName}`]));
-    const mappedMembers = links.map((link) => ({
-      id: link.memberId,
-      parentMemberId: link.parentMemberId,
-      name: memberNameById.get(link.memberId) || "Unknown Member",
-      tags: [] as string[]
-    }));
+    const memberById = new Map(linkedMembers.map((m) => [Number(m.id), m]));
+    const mappedMembers = links.map((link) => {
+      const member = memberById.get(Number(link.memberId));
+      return {
+        id: link.memberId,
+        parentMemberId: link.parentMemberId,
+        firstName: member?.firstName || "",
+        lastName: member?.lastName || "",
+        phone: member?.phone || null,
+        name: member ? `${member.firstName} ${member.lastName}` : "Unknown Member",
+        tags: [] as string[]
+      };
+    });
 
     const memberIds = [row.coachMemberId, ...ids].filter(Boolean);
     const tagMap = await this.loadMemberTags(memberIds);
@@ -59,10 +65,13 @@ export class LifeGroupsService {
       ...row,
       coachId: row.coachMemberId,
       coachName: coach ? `${coach.firstName} ${coach.lastName}` : "-",
-      coachTags: coach ? tagMap.get(coach.id) || [] : [],
+      coachFirstName: coach?.firstName || null,
+      coachLastName: coach?.lastName || null,
+      coachPhone: coach?.phone || null,
+      coachTags: coach ? tagMap.get(Number(coach.id)) || [] : [],
       members: mappedMembers.map((member) => ({
         ...member,
-        tags: tagMap.get(member.id) || []
+        tags: tagMap.get(Number(member.id)) || []
       }))
     };
   }
