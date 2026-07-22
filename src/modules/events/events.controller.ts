@@ -84,6 +84,11 @@ export class EventsController {
     return this.eventsService.importParticipantsBulk(Number(id), body);
   }
 
+  @Post(":id/participants/link-members")
+  linkParticipantsToMembers(@Param("id") id: string, @Body() body: any) {
+    return this.eventsService.linkParticipantsToMembers(Number(id), body || {});
+  }
+
   @Put(":id/participants/:participantId")
   editParticipant(
     @Param("id") id: string,

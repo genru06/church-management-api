@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
-import { In, Repository } from "typeorm";
+import { In, IsNull, Repository } from "typeorm";
 import { EventEntity } from "../../entities/event.entity";
 import { EventParticipantEntity } from "../../entities/event-participant.entity";
 import { EventPledgeEntity } from "../../entities/event-pledge.entity";
@@ -967,6 +967,108 @@ export class EventsService {
     if (!existing) throw new NotFoundException("Participant not found");
     await this.participantsRepo.delete(participantId);
     return { id: participantId, deleted: true };
+  }
+
+  private parseGuestFullName(fullName: string) {
+    const parts = fullName.trim().replace(/\s+/g, " ").split(" ").filter(Boolean);
+    if (parts.length < 2) return { firstName: null as string | null, lastName: null as string | null };
+    return {
+      firstName: parts.slice(0, -1).join(" "),
+      lastName: parts[parts.length - 1]
+    };
+  }
+
+  async linkParticipantsToMembers(eventId: number, body: { participantIds?: number[] } = {}) {
+    await this.getEventOrFail(eventId);
+
+    const unlinked = await this.participantsRepo.find({
+      where: { eventId, memberId: IsNull() }
+    });
+
+    const requestedIds = Array.isArray(body.participantIds)
+      ? new Set(body.participantIds.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0))
+      : null;
+
+    const candidates = requestedIds?.size
+      ? unlinked.filter((row) => requestedIds.has(Number(row.id)))
+      : unlinked;
+
+    if (!candidates.length) {
+      return { linked: 0, unmatched: 0, skipped: 0, participants: [], unmatchedNames: [], skippedNames: [] };
+    }
+
+    const allParticipants = await this.participantsRepo.find({
+      where: { eventId },
+      select: ["id", "memberId"]
+    });
+    const registeredMemberIds = new Set(
+      allParticipants.map((row) => row.memberId).filter(Boolean).map((id) => Number(id))
+    );
+
+    const members = await this.membersRepo.find();
+    const memberByFullName = new Map<string, MemberEntity>();
+    for (const member of members) {
+      const key = this.normalizeParticipantName(`${member.firstName} ${member.lastName}`);
+      if (!memberByFullName.has(key)) {
+        memberByFullName.set(key, member);
+      }
+    }
+
+    const linkedRows: number[] = [];
+    const unmatchedNames: string[] = [];
+    const skippedNames: string[] = [];
+
+    for (const participant of candidates) {
+      const fullName = participant.fullName?.trim() || "";
+      if (!fullName) {
+        unmatchedNames.push(participant.fullName || `Participant #${participant.id}`);
+        continue;
+      }
+
+      const nameKey = this.normalizeParticipantName(fullName);
+      let member = memberByFullName.get(nameKey) || null;
+
+      if (!member) {
+        const parsed = this.parseGuestFullName(fullName);
+        if (parsed.firstName && parsed.lastName) {
+          member = await this.findMemberByName(parsed.firstName, parsed.lastName);
+        }
+      }
+
+      if (!member) {
+        unmatchedNames.push(fullName);
+        continue;
+      }
+
+      if (registeredMemberIds.has(Number(member.id))) {
+        skippedNames.push(fullName);
+        continue;
+      }
+
+      await this.participantsRepo.update(participant.id, {
+        memberId: member.id,
+        fullName: `${member.firstName} ${member.lastName}`,
+        email: member.email ?? participant.email,
+        phone: member.phone ?? participant.phone
+      });
+
+      registeredMemberIds.add(Number(member.id));
+      linkedRows.push(participant.id);
+    }
+
+    const refreshed = linkedRows.length
+      ? await this.participantsRepo.find({ where: { id: In(linkedRows) } })
+      : [];
+    const participants = refreshed.length ? await this.enrichParticipants(refreshed) : [];
+
+    return {
+      linked: participants.length,
+      unmatched: unmatchedNames.length,
+      skipped: skippedNames.length,
+      participants,
+      unmatchedNames,
+      skippedNames
+    };
   }
 
   async checkIn(eventId: number, body: any) {
