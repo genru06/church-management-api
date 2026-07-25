@@ -1258,28 +1258,19 @@ export class EventsService {
       throw new BadRequestException("Reserved count must be zero or greater");
     }
 
-    const participantType = body.participantType?.trim() || "";
-    if (!participantType) throw new BadRequestException("Participant type is required");
+    const groupName = (body.label || body.groupName || body.participantType || "").trim();
+    if (!groupName) throw new BadRequestException("Group name is required");
 
-    const churchId = await this.resolveChurchId(body.churchId);
-    let label = body.label?.trim() || "";
-    if (churchId) {
-      const church = await this.churchesRepo.findOne({ where: { id: churchId } });
-      if (!church) throw new BadRequestException("Church not found");
-      if (!label) label = getChurchDisplayName(church);
-    }
-    if (!label) throw new BadRequestException("Reservation label is required");
-
-    await this.assertReservationUnique(eventId, churchId, label, participantType);
+    await this.assertReservationUnique(eventId, groupName);
 
     const saved = await this.reservationsRepo.save(
       this.reservationsRepo.create({
         eventId,
-        churchId,
-        label,
-        participantType,
+        churchId: null,
+        label: groupName,
+        participantType: groupName,
         reservedCount,
-        notes: body.notes?.trim() || null
+        notes: null
       })
     );
     await this.syncExpectedParticipantsFromReservations(eventId);
@@ -1298,30 +1289,24 @@ export class EventsService {
       throw new BadRequestException("Reserved count must be zero or greater");
     }
 
-    const participantType =
-      body.participantType !== undefined
-        ? body.participantType?.trim() || ""
-        : existing.participantType;
-    if (!participantType) throw new BadRequestException("Participant type is required");
+    const groupName = (
+      body.label ??
+      body.groupName ??
+      body.participantType ??
+      existing.label
+    )
+      .toString()
+      .trim();
+    if (!groupName) throw new BadRequestException("Group name is required");
 
-    const churchId =
-      body.churchId !== undefined ? await this.resolveChurchId(body.churchId) : existing.churchId;
-    let label = body.label !== undefined ? body.label?.trim() || "" : existing.label;
-    if (churchId) {
-      const church = await this.churchesRepo.findOne({ where: { id: churchId } });
-      if (!church) throw new BadRequestException("Church not found");
-      if (!label) label = getChurchDisplayName(church);
-    }
-    if (!label) throw new BadRequestException("Reservation label is required");
-
-    await this.assertReservationUnique(eventId, churchId, label, participantType, reservationId);
+    await this.assertReservationUnique(eventId, groupName, reservationId);
 
     await this.reservationsRepo.update(reservationId, {
-      churchId,
-      label,
-      participantType,
+      churchId: null,
+      label: groupName,
+      participantType: groupName,
       reservedCount,
-      notes: body.notes !== undefined ? body.notes?.trim() || null : existing.notes
+      notes: null
     });
     await this.syncExpectedParticipantsFromReservations(eventId);
 
@@ -1330,26 +1315,15 @@ export class EventsService {
     return mapped;
   }
 
-  private async assertReservationUnique(
-    eventId: number,
-    churchId: number | null,
-    label: string,
-    participantType: string,
-    excludeId?: number
-  ) {
+  private async assertReservationUnique(eventId: number, groupName: string, excludeId?: number) {
     const rows = await this.reservationsRepo.find({ where: { eventId } });
-    const typeKey = participantType.trim().toLowerCase();
-    const labelKey = label.trim().toLowerCase();
+    const nameKey = groupName.trim().toLowerCase();
     const duplicate = rows.find((row) => {
       if (excludeId && row.id === excludeId) return false;
-      if (row.participantType.trim().toLowerCase() !== typeKey) return false;
-      if (churchId) return row.churchId === churchId;
-      return !row.churchId && row.label.trim().toLowerCase() === labelKey;
+      return row.label.trim().toLowerCase() === nameKey;
     });
     if (duplicate) {
-      throw new BadRequestException(
-        "A reservation with this church/label and participant type already exists"
-      );
+      throw new BadRequestException("A reservation with this group name already exists");
     }
   }
 
