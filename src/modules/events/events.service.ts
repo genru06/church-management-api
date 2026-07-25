@@ -4,6 +4,7 @@ import { In, IsNull, Repository } from "typeorm";
 import { EventEntity } from "../../entities/event.entity";
 import { EventParticipantEntity } from "../../entities/event-participant.entity";
 import { EventPledgeEntity } from "../../entities/event-pledge.entity";
+import { EventReservationEntity } from "../../entities/event-reservation.entity";
 import { MemberEntity } from "../../entities/member.entity";
 import { UserEntity } from "../../entities/user.entity";
 import { ChurchEntity } from "../../entities/church.entity";
@@ -31,6 +32,8 @@ export class EventsService {
     @InjectRepository(EventEntity) private readonly eventsRepo: Repository<EventEntity>,
     @InjectRepository(EventParticipantEntity) private readonly participantsRepo: Repository<EventParticipantEntity>,
     @InjectRepository(EventPledgeEntity) private readonly pledgesRepo: Repository<EventPledgeEntity>,
+    @InjectRepository(EventReservationEntity)
+    private readonly reservationsRepo: Repository<EventReservationEntity>,
     @InjectRepository(MemberEntity) private readonly membersRepo: Repository<MemberEntity>,
     @InjectRepository(UserEntity) private readonly usersRepo: Repository<UserEntity>,
     @InjectRepository(ChurchEntity) private readonly churchesRepo: Repository<ChurchEntity>,
@@ -497,6 +500,21 @@ export class EventsService {
     };
   }
 
+  private mapReservation(row: EventReservationEntity, churchName: string | null = null) {
+    return {
+      id: row.id,
+      eventId: row.eventId,
+      churchId: row.churchId,
+      churchName,
+      label: row.label,
+      participantType: row.participantType,
+      reservedCount: Number(row.reservedCount),
+      notes: row.notes,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt
+    };
+  }
+
   private async getEventOrFail(id: number) {
     const row = await this.eventsRepo.findOne({ where: { id } });
     if (!row) throw new NotFoundException("Event not found");
@@ -582,6 +600,7 @@ export class EventsService {
 
   async remove(id: number) {
     await this.getEventOrFail(id);
+    await this.reservationsRepo.delete({ eventId: id });
     await this.pledgesRepo.delete({ eventId: id });
     await this.participantsRepo.delete({ eventId: id });
     await this.eventsRepo.delete(id);
@@ -1204,10 +1223,150 @@ export class EventsService {
     return { id: pledgeId, deleted: true };
   }
 
+  private async syncExpectedParticipantsFromReservations(eventId: number) {
+    const rows = await this.reservationsRepo.find({ where: { eventId } });
+    const total = rows.reduce((sum, row) => sum + Number(row.reservedCount || 0), 0);
+    await this.eventsRepo.update(eventId, {
+      expectedParticipants: rows.length ? total : null
+    });
+    return total;
+  }
+
+  private async enrichReservations(rows: EventReservationEntity[]) {
+    const churchIds = [...new Set(rows.map((row) => row.churchId).filter(Boolean))] as number[];
+    const churches = churchIds.length
+      ? await this.churchesRepo.find({ where: { id: In(churchIds) } })
+      : [];
+    const churchNameById = new Map(churches.map((church) => [church.id, getChurchDisplayName(church)]));
+
+    return rows.map((row) =>
+      this.mapReservation(row, row.churchId ? churchNameById.get(row.churchId) || null : null)
+    );
+  }
+
+  async listReservations(eventId: number) {
+    await this.getEventOrFail(eventId);
+    const rows = await this.reservationsRepo.find({ where: { eventId }, order: { id: "ASC" } });
+    return this.enrichReservations(rows);
+  }
+
+  async addReservation(eventId: number, body: any) {
+    await this.getEventOrFail(eventId);
+
+    const reservedCount = Number(body.reservedCount);
+    if (!Number.isFinite(reservedCount) || reservedCount < 0) {
+      throw new BadRequestException("Reserved count must be zero or greater");
+    }
+
+    const participantType = body.participantType?.trim() || "";
+    if (!participantType) throw new BadRequestException("Participant type is required");
+
+    const churchId = await this.resolveChurchId(body.churchId);
+    let label = body.label?.trim() || "";
+    if (churchId) {
+      const church = await this.churchesRepo.findOne({ where: { id: churchId } });
+      if (!church) throw new BadRequestException("Church not found");
+      if (!label) label = getChurchDisplayName(church);
+    }
+    if (!label) throw new BadRequestException("Reservation label is required");
+
+    await this.assertReservationUnique(eventId, churchId, label, participantType);
+
+    const saved = await this.reservationsRepo.save(
+      this.reservationsRepo.create({
+        eventId,
+        churchId,
+        label,
+        participantType,
+        reservedCount,
+        notes: body.notes?.trim() || null
+      })
+    );
+    await this.syncExpectedParticipantsFromReservations(eventId);
+    const [mapped] = await this.enrichReservations([saved]);
+    return mapped;
+  }
+
+  async editReservation(eventId: number, reservationId: number, body: any) {
+    await this.getEventOrFail(eventId);
+    const existing = await this.reservationsRepo.findOne({ where: { id: reservationId, eventId } });
+    if (!existing) throw new NotFoundException("Reservation not found");
+
+    const reservedCount =
+      body.reservedCount !== undefined ? Number(body.reservedCount) : existing.reservedCount;
+    if (!Number.isFinite(reservedCount) || reservedCount < 0) {
+      throw new BadRequestException("Reserved count must be zero or greater");
+    }
+
+    const participantType =
+      body.participantType !== undefined
+        ? body.participantType?.trim() || ""
+        : existing.participantType;
+    if (!participantType) throw new BadRequestException("Participant type is required");
+
+    const churchId =
+      body.churchId !== undefined ? await this.resolveChurchId(body.churchId) : existing.churchId;
+    let label = body.label !== undefined ? body.label?.trim() || "" : existing.label;
+    if (churchId) {
+      const church = await this.churchesRepo.findOne({ where: { id: churchId } });
+      if (!church) throw new BadRequestException("Church not found");
+      if (!label) label = getChurchDisplayName(church);
+    }
+    if (!label) throw new BadRequestException("Reservation label is required");
+
+    await this.assertReservationUnique(eventId, churchId, label, participantType, reservationId);
+
+    await this.reservationsRepo.update(reservationId, {
+      churchId,
+      label,
+      participantType,
+      reservedCount,
+      notes: body.notes !== undefined ? body.notes?.trim() || null : existing.notes
+    });
+    await this.syncExpectedParticipantsFromReservations(eventId);
+
+    const updated = await this.reservationsRepo.findOne({ where: { id: reservationId } });
+    const [mapped] = await this.enrichReservations([updated!]);
+    return mapped;
+  }
+
+  private async assertReservationUnique(
+    eventId: number,
+    churchId: number | null,
+    label: string,
+    participantType: string,
+    excludeId?: number
+  ) {
+    const rows = await this.reservationsRepo.find({ where: { eventId } });
+    const typeKey = participantType.trim().toLowerCase();
+    const labelKey = label.trim().toLowerCase();
+    const duplicate = rows.find((row) => {
+      if (excludeId && row.id === excludeId) return false;
+      if (row.participantType.trim().toLowerCase() !== typeKey) return false;
+      if (churchId) return row.churchId === churchId;
+      return !row.churchId && row.label.trim().toLowerCase() === labelKey;
+    });
+    if (duplicate) {
+      throw new BadRequestException(
+        "A reservation with this church/label and participant type already exists"
+      );
+    }
+  }
+
+  async removeReservation(eventId: number, reservationId: number) {
+    await this.getEventOrFail(eventId);
+    const existing = await this.reservationsRepo.findOne({ where: { id: reservationId, eventId } });
+    if (!existing) throw new NotFoundException("Reservation not found");
+    await this.reservationsRepo.delete(reservationId);
+    await this.syncExpectedParticipantsFromReservations(eventId);
+    return { id: reservationId, deleted: true };
+  }
+
   async dashboard(eventId: number) {
     const event = await this.view(eventId);
     const participants = await this.listParticipants(eventId);
     const pledges = event.allowPledges ? await this.listPledges(eventId) : [];
+    const reservations = await this.listReservations(eventId);
 
     const attendedCount = participants.filter((p) => p.attendedAt).length;
     const kidsCount = participants.filter((p) => p.isKid).length;
@@ -1217,16 +1376,21 @@ export class EventsService {
       .reduce((sum, p) => sum + (p.registrationAmount || 0), 0);
     const pledgesCollected = pledges.filter((p) => p.paid).reduce((sum, p) => sum + p.amount, 0);
     const pledgesTotal = pledges.reduce((sum, p) => sum + p.amount, 0);
+    const reservedTotal = reservations.reduce((sum, row) => sum + row.reservedCount, 0);
 
     return {
       event,
       participants,
       pledges,
+      reservations,
       stats: {
         participantCount: participants.length,
         adultCount,
         kidsCount,
-        expectedParticipants: event.expectedParticipants || 0,
+        expectedParticipants: reservations.length
+          ? reservedTotal
+          : event.expectedParticipants || 0,
+        reservedTotal,
         attendedCount,
         attendanceRate: participants.length ? Math.round((attendedCount / participants.length) * 100) : 0,
         registrationCollected,

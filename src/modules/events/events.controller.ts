@@ -59,6 +59,11 @@ export class EventsController {
     return this.eventsService.listPledges(Number(id));
   }
 
+  @Get(":id/reservations")
+  listReservations(@Param("id") id: string) {
+    return this.eventsService.listReservations(Number(id));
+  }
+
   @Get(":id")
   view(@Param("id") id: string) {
     return this.eventsService.view(Number(id));
@@ -130,5 +135,24 @@ export class EventsController {
   @Delete(":id/pledges/:pledgeId")
   removePledge(@Param("id") id: string, @Param("pledgeId") pledgeId: string) {
     return this.eventsService.removePledge(Number(id), Number(pledgeId));
+  }
+
+  @Post(":id/reservations")
+  addReservation(@Param("id") id: string, @Body() body: any) {
+    return this.eventsService.addReservation(Number(id), body);
+  }
+
+  @Put(":id/reservations/:reservationId")
+  editReservation(
+    @Param("id") id: string,
+    @Param("reservationId") reservationId: string,
+    @Body() body: any
+  ) {
+    return this.eventsService.editReservation(Number(id), Number(reservationId), body);
+  }
+
+  @Delete(":id/reservations/:reservationId")
+  removeReservation(@Param("id") id: string, @Param("reservationId") reservationId: string) {
+    return this.eventsService.removeReservation(Number(id), Number(reservationId));
   }
 }

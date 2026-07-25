@@ -44,6 +44,7 @@ import { CityEntity } from "../entities/city.entity";
 import { EventEntity } from "../entities/event.entity";
 import { EventParticipantEntity } from "../entities/event-participant.entity";
 import { EventPledgeEntity } from "../entities/event-pledge.entity";
+import { EventReservationEntity } from "../entities/event-reservation.entity";
 import { TitheEntity } from "../entities/tithe.entity";
 import { OfferingEntity } from "../entities/offering.entity";
 import { ExpenseEntity } from "../entities/expense.entity";
@@ -67,6 +68,7 @@ const entities = [
   EventEntity,
   EventParticipantEntity,
   EventPledgeEntity,
+  EventReservationEntity,
   TitheEntity,
   OfferingEntity,
   ExpenseEntity,
