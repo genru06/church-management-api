@@ -16,8 +16,12 @@ export class MembersController {
   }
 
   @Get()
-  list(@Query("search") search?: string, @Query("tag") tag?: string | string[]) {
-    return this.membersService.list(search, tag);
+  list(
+    @Query("search") search?: string,
+    @Query("tag") tag?: string | string[],
+    @Query("lifeGroupId") lifeGroupId?: string | string[]
+  ) {
+    return this.membersService.list(search, tag, lifeGroupId);
   }
 
   @Get(":id")

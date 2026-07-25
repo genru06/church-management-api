@@ -63,7 +63,7 @@ export class MembersService {
     return this.view(saved.id);
   }
 
-  async list(search?: string, tag?: string | string[]) {
+  async list(search?: string, tag?: string | string[], lifeGroupId?: string | string[]) {
     const qb = this.membersRepo.createQueryBuilder("member")
       .orderBy("member.lastName", "ASC")
       .addOrderBy("member.firstName", "ASC");
@@ -77,6 +77,13 @@ export class MembersService {
       const taggedIds = await this.getMemberIdsByTagNames(tagTerms);
       if (!taggedIds.length) return [];
       qb.andWhere("member.id IN (:...taggedIds)", { taggedIds });
+    }
+
+    const lifeGroupIds = this.normalizeLifeGroupIds(lifeGroupId);
+    if (lifeGroupIds.length) {
+      const lifeGroupMemberIds = await this.getMemberIdsByLifeGroupIds(lifeGroupIds);
+      if (!lifeGroupMemberIds.length) return [];
+      qb.andWhere("member.id IN (:...lifeGroupMemberIds)", { lifeGroupMemberIds });
     }
 
     const rows = await qb.getMany();
@@ -423,6 +430,23 @@ export class MembersService {
     return names;
   }
 
+  private normalizeLifeGroupIds(lifeGroupId?: string | string[]) {
+    const raw = Array.isArray(lifeGroupId) ? lifeGroupId : lifeGroupId != null ? [lifeGroupId] : [];
+    const seen = new Set<number>();
+    const ids: number[] = [];
+
+    for (const entry of raw) {
+      for (const part of String(entry || "").split(",")) {
+        const id = Number(part.trim());
+        if (!Number.isInteger(id) || id <= 0 || seen.has(id)) continue;
+        seen.add(id);
+        ids.push(id);
+      }
+    }
+
+    return ids;
+  }
+
   private async getMemberIdsByTagNames(tagNames: string[]) {
     if (!tagNames.length) return [];
 
@@ -434,6 +458,28 @@ export class MembersService {
        INNER JOIN tag t ON t.id = mt.tag_id AND LOWER(t.name) IN (${placeholders})
        ORDER BY m.id DESC`,
       tagNames.map((name) => name.toLowerCase())
+    );
+    return rows.map((row: { id: string | number }) => Number(row.id));
+  }
+
+  private async getMemberIdsByLifeGroupIds(lifeGroupIds: number[]) {
+    if (!lifeGroupIds.length) return [];
+
+    const placeholders = lifeGroupIds.map(() => "?").join(",");
+    const rows = await this.membersRepo.query(
+      `SELECT DISTINCT memberId AS id FROM (
+         SELECT lm.member_id AS memberId
+         FROM lifegroup_member lm
+         WHERE lm.lifegroup_id IN (${placeholders})
+         UNION
+         SELECT lg.coach_member_id AS memberId
+         FROM lifegroup lg
+         WHERE lg.id IN (${placeholders})
+           AND lg.coach_member_id IS NOT NULL
+       ) linked
+       WHERE memberId IS NOT NULL
+       ORDER BY memberId DESC`,
+      [...lifeGroupIds, ...lifeGroupIds]
     );
     return rows.map((row: { id: string | number }) => Number(row.id));
   }
