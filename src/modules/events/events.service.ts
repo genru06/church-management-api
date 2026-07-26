@@ -126,6 +126,8 @@ export class EventsService {
       lifegroupId?: number | null;
       churchName?: string | null;
       lifegroupName?: string | null;
+      reservationId?: number | null;
+      reservationLabel?: string | null;
       memberQrToken?: string | null;
     } = {}
   ) {
@@ -133,6 +135,8 @@ export class EventsService {
       id: row.id,
       eventId: row.eventId,
       memberId: row.memberId,
+      reservationId: extras.reservationId ?? row.reservationId ?? null,
+      reservationLabel: extras.reservationLabel ?? null,
       firstName: extras.firstName ?? null,
       lastName: extras.lastName ?? null,
       fullName: extras.fullName ?? row.fullName,
@@ -185,6 +189,12 @@ export class EventsService {
     const memberById = new Map(members.map((m) => [Number(m.id), m]));
     const tagsByMemberId = await this.loadMemberTagsByMemberId(memberIds);
 
+    const reservationIds = [...new Set(rows.map((r) => r.reservationId).filter(Boolean) as number[])];
+    const reservations = reservationIds.length
+      ? await this.reservationsRepo.find({ where: { id: In(reservationIds) } })
+      : [];
+    const reservationById = new Map(reservations.map((r) => [Number(r.id), r]));
+
     const links = memberIds.length
       ? await this.lifeGroupMembersRepo.find({ where: { memberId: In(memberIds) } })
       : [];
@@ -235,11 +245,23 @@ export class EventsService {
           : null;
         const tags = row.memberId ? tagsByMemberId.get(Number(row.memberId)) || [] : [];
         const isKid = this.isKidsTagged(tags);
+        const reservation = row.reservationId ? reservationById.get(Number(row.reservationId)) : null;
+        const guestNameParts =
+          !member && row.fullName
+            ? String(row.fullName)
+                .trim()
+                .split(/\s+/)
+                .filter(Boolean)
+            : [];
 
         return {
           ...this.mapParticipant(row, {
-            firstName: member?.firstName ?? null,
-            lastName: member?.lastName ?? null,
+            firstName: member?.firstName ?? (guestNameParts.length > 1 ? guestNameParts[0] : null),
+            lastName:
+              member?.lastName ??
+              (guestNameParts.length > 1
+                ? guestNameParts.slice(1).join(" ")
+                : guestNameParts[0] || null),
             fullName: member ? `${member.firstName} ${member.lastName}` : row.fullName,
             email: member?.email ?? row.email,
             phone: member?.phone ?? row.phone,
@@ -247,6 +269,8 @@ export class EventsService {
             lifegroupId: lifegroup?.id ?? null,
             churchName: churchId ? churchNameById.get(churchId) || null : null,
             lifegroupName: lifegroup?.name ?? null,
+            reservationId: reservation?.id ?? row.reservationId ?? null,
+            reservationLabel: reservation?.label ?? null,
             memberQrToken: member?.qrToken ?? null
           }),
           tags,
@@ -446,11 +470,16 @@ export class EventsService {
     }
   }
 
-  private async createEventParticipant(event: EventEntity, member: MemberEntity) {
+  private async createEventParticipant(
+    event: EventEntity,
+    member: MemberEntity,
+    reservationId: number | null = null
+  ) {
     const saved = await this.participantsRepo.save(
       this.participantsRepo.create({
         eventId: event.id,
         memberId: member.id,
+        reservationId,
         fullName: `${member.firstName} ${member.lastName}`,
         email: member.email,
         phone: member.phone,
@@ -465,7 +494,14 @@ export class EventsService {
 
   private async createGuestEventParticipant(
     event: EventEntity,
-    body: { fullName: string; email?: string | null; phone?: string | null }
+    body: {
+      fullName: string;
+      email?: string | null;
+      phone?: string | null;
+      firstName?: string | null;
+      lastName?: string | null;
+      reservationId?: number | null;
+    }
   ) {
     const fullName = body.fullName.trim();
     await this.assertGuestNotAlreadyRegistered(event.id, fullName);
@@ -474,6 +510,7 @@ export class EventsService {
       this.participantsRepo.create({
         eventId: event.id,
         memberId: null,
+        reservationId: body.reservationId ?? null,
         fullName,
         email: body.email?.trim() || null,
         phone: body.phone?.trim() || null,
@@ -1397,10 +1434,18 @@ export class EventsService {
     const event = await this.getEventOrFail(eventId);
     const registration = this.getRegistrationStatus(event);
     const options = await this.loadSignupOptions();
+    const reservations = await this.listReservations(eventId);
     return {
       event: this.mapEvent(event),
       ...registration,
-      ...options
+      ...options,
+      reservations: reservations
+        .filter((row) => !row.churchId)
+        .map((row) => ({
+          id: row.id,
+          label: row.label,
+          reservedCount: row.reservedCount
+        }))
     };
   }
 
@@ -1435,6 +1480,17 @@ export class EventsService {
     return this.payRegistration(eventId, participantId, body);
   }
 
+  private async resolveSignupReservation(eventId: number, reservationId: number | null) {
+    if (!reservationId) return null;
+
+    const reservation = await this.reservationsRepo.findOne({ where: { id: reservationId, eventId } });
+    if (!reservation) throw new NotFoundException("Reservation list not found");
+    if (reservation.churchId) {
+      throw new BadRequestException("Selected reservation list is not available for guest registration.");
+    }
+    return reservation;
+  }
+
   async publicSignup(eventId: number, body: any) {
     const event = await this.getEventOrFail(eventId);
     await this.assertRegistrationOpen(event);
@@ -1443,17 +1499,36 @@ export class EventsService {
     const lastName = body.lastName?.trim();
     const churchId = body.churchId ? Number(body.churchId) : null;
     const lifegroupId = body.lifegroupId ? Number(body.lifegroupId) : null;
+    const reservationId = body.reservationId ? Number(body.reservationId) : null;
 
     if (!firstName) throw new BadRequestException("First name is required");
     if (!lastName) throw new BadRequestException("Last name is required");
-    if (!churchId) throw new BadRequestException("Church is required");
+    if (churchId && reservationId) {
+      throw new BadRequestException("Choose either a church or a reservation list, not both.");
+    }
+    if (lifegroupId && !churchId) {
+      throw new BadRequestException("LifeGroup can only be selected with a church.");
+    }
 
-    await this.validateChurchAndLifeGroup(churchId, lifegroupId);
+    const reservation = await this.resolveSignupReservation(eventId, reservationId);
+    const resolvedReservationId = reservation ? Number(reservation.id) : null;
 
-    const { member } = await this.resolveMemberForRegistration(firstName, lastName, lifegroupId, churchId);
-    await this.assertNotAlreadyRegistered(eventId, member.id);
+    let participant;
+    if (churchId) {
+      await this.validateChurchAndLifeGroup(churchId, lifegroupId);
 
-    const participant = await this.createEventParticipant(event, member);
+      const { member } = await this.resolveMemberForRegistration(firstName, lastName, lifegroupId, churchId);
+      await this.assertNotAlreadyRegistered(eventId, member.id);
+      participant = await this.createEventParticipant(event, member, null);
+    } else {
+      participant = await this.createGuestEventParticipant(event, {
+        firstName,
+        lastName,
+        fullName: `${firstName} ${lastName}`,
+        reservationId: resolvedReservationId
+      });
+    }
+
     const paymentRequired = Number(event.registrationFee || 0) > 0;
 
     return {

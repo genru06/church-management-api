@@ -11,6 +11,9 @@ export class EventParticipantEntity {
   @Column({ name: "member_id", type: "bigint", unsigned: true, nullable: true })
   memberId: number | null;
 
+  @Column({ name: "reservation_id", type: "bigint", unsigned: true, nullable: true })
+  reservationId: number | null;
+
   @Column({ name: "full_name", type: "varchar", length: 200 })
   fullName: string;
 
