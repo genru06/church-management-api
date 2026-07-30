@@ -538,7 +538,11 @@ export class EventsService {
     };
   }
 
-  private mapReservation(row: EventReservationEntity, churchName: string | null = null) {
+  private mapReservation(
+    row: EventReservationEntity,
+    churchName: string | null = null,
+    filledCount = 0
+  ) {
     return {
       id: row.id,
       eventId: row.eventId,
@@ -547,10 +551,41 @@ export class EventsService {
       label: row.label,
       participantType: row.participantType,
       reservedCount: Number(row.reservedCount),
+      filledCount: Number(filledCount || 0),
       notes: row.notes,
       createdAt: row.createdAt,
       updatedAt: row.updatedAt
     };
+  }
+
+  private async countReservationParticipants(eventId: number, reservationId: number) {
+    return this.participantsRepo.count({ where: { eventId, reservationId } });
+  }
+
+  private async assertReservationHasCapacity(
+    eventId: number,
+    reservationId: number,
+    addCount = 1,
+    reservation?: EventReservationEntity | null
+  ) {
+    const existing =
+      reservation ||
+      (await this.reservationsRepo.findOne({ where: { id: reservationId, eventId } }));
+    if (!existing) throw new NotFoundException("Reservation list not found");
+
+    const filledCount = await this.countReservationParticipants(eventId, reservationId);
+    const reservedCount = Number(existing.reservedCount || 0);
+    const remaining = Math.max(reservedCount - filledCount, 0);
+
+    if (addCount > remaining) {
+      throw new BadRequestException(
+        remaining === 0
+          ? `Reservation "${existing.label}" is already filled (${filledCount}/${reservedCount}).`
+          : `Only ${remaining} slot(s) left on reservation "${existing.label}" (${filledCount}/${reservedCount}).`
+      );
+    }
+
+    return { reservation: existing, filledCount, reservedCount, remaining };
   }
 
   private async getEventOrFail(id: number) {
@@ -973,10 +1008,16 @@ export class EventsService {
       throw new BadRequestException("Participant full name is required");
     }
 
+    const reservationId = body.reservationId ? Number(body.reservationId) : null;
+    if (reservationId) {
+      await this.assertReservationHasCapacity(eventId, reservationId, 1);
+    }
+
     return this.createGuestEventParticipant(event, {
       fullName,
       email: body.email,
-      phone: body.phone
+      phone: body.phone,
+      reservationId
     });
   }
 
@@ -1598,8 +1639,28 @@ export class EventsService {
       : [];
     const churchNameById = new Map(churches.map((church) => [church.id, getChurchDisplayName(church)]));
 
+    const reservationIds = rows.map((row) => Number(row.id)).filter(Boolean);
+    const filledCountById = new Map<number, number>();
+    if (reservationIds.length) {
+      const counts = await this.participantsRepo
+        .createQueryBuilder("participant")
+        .select("participant.reservationId", "reservationId")
+        .addSelect("COUNT(*)", "count")
+        .where("participant.reservationId IN (:...reservationIds)", { reservationIds })
+        .groupBy("participant.reservationId")
+        .getRawMany();
+
+      for (const row of counts) {
+        filledCountById.set(Number(row.reservationId), Number(row.count || 0));
+      }
+    }
+
     return rows.map((row) =>
-      this.mapReservation(row, row.churchId ? churchNameById.get(row.churchId) || null : null)
+      this.mapReservation(
+        row,
+        row.churchId ? churchNameById.get(row.churchId) || null : null,
+        filledCountById.get(Number(row.id)) || 0
+      )
     );
   }
 
@@ -1693,6 +1754,62 @@ export class EventsService {
     await this.reservationsRepo.delete(reservationId);
     await this.syncReservedParticipantsFromReservations(eventId);
     return { id: reservationId, deleted: true };
+  }
+
+  async addReservationParticipants(eventId: number, reservationId: number, body: any) {
+    const event = await this.getEventOrFail(eventId);
+    const reservation = await this.reservationsRepo.findOne({ where: { id: reservationId, eventId } });
+    if (!reservation) throw new NotFoundException("Reservation list not found");
+
+    const rawNames = Array.isArray(body?.names)
+      ? body.names
+      : typeof body?.namesText === "string"
+        ? body.namesText.split(/\r?\n/)
+        : [];
+
+    const names = rawNames
+      .map((name: unknown) => String(name || "").trim())
+      .filter((name: string) => !!name);
+
+    if (!names.length) {
+      throw new BadRequestException("Add at least one name.");
+    }
+
+    const uniqueNames: string[] = [];
+    const seen = new Set<string>();
+    for (const name of names) {
+      const key = this.normalizeParticipantName(name);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      uniqueNames.push(name);
+    }
+
+    await this.assertReservationHasCapacity(eventId, reservationId, uniqueNames.length, reservation);
+
+    const created = [];
+    const errors: { name: string; message: string }[] = [];
+
+    for (const fullName of uniqueNames) {
+      try {
+        const participant = await this.createGuestEventParticipant(event, {
+          fullName,
+          reservationId
+        });
+        created.push(participant);
+      } catch (err) {
+        errors.push({
+          name: fullName,
+          message: err instanceof Error ? err.message : "Failed to add participant."
+        });
+      }
+    }
+
+    return {
+      created: created.length,
+      participants: created,
+      errors,
+      reservation: (await this.enrichReservations([reservation]))[0]
+    };
   }
 
   async dashboard(eventId: number) {
@@ -1835,6 +1952,9 @@ export class EventsService {
 
     const reservation = await this.resolveSignupReservation(eventId, reservationId);
     const resolvedReservationId = reservation ? Number(reservation.id) : null;
+    if (resolvedReservationId) {
+      await this.assertReservationHasCapacity(eventId, resolvedReservationId, 1, reservation);
+    }
 
     let participant;
     if (churchId) {

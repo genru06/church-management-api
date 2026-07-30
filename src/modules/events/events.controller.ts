@@ -147,6 +147,15 @@ export class EventsController {
     return this.eventsService.addReservation(Number(id), body);
   }
 
+  @Post(":id/reservations/:reservationId/participants")
+  addReservationParticipants(
+    @Param("id") id: string,
+    @Param("reservationId") reservationId: string,
+    @Body() body: any
+  ) {
+    return this.eventsService.addReservationParticipants(Number(id), Number(reservationId), body);
+  }
+
   @Put(":id/reservations/:reservationId")
   editReservation(
     @Param("id") id: string,
