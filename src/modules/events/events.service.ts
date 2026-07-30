@@ -986,6 +986,49 @@ export class EventsService {
     if (!existing) throw new NotFoundException("Participant not found");
 
     const lifegroupId = body.lifegroupId ? Number(body.lifegroupId) : null;
+    const churchId = body.churchId ? Number(body.churchId) : null;
+    const addAsMember = !!body.addAsMember;
+
+    if (addAsMember) {
+      if (existing.memberId) {
+        throw new BadRequestException("This participant is already linked to a member.");
+      }
+      if (!churchId) {
+        throw new BadRequestException("Church is required when adding a participant as a member.");
+      }
+
+      const name = this.buildParticipantName(body, existing.fullName);
+      if (!name.firstName || !name.lastName) {
+        throw new BadRequestException("Participant first name and last name are required");
+      }
+
+      await this.validateChurchAndLifeGroup(churchId, lifegroupId);
+      const { member } = await this.resolveMemberForRegistration(
+        name.firstName,
+        name.lastName,
+        lifegroupId,
+        churchId
+      );
+
+      const alreadyRegistered = await this.participantsRepo.findOne({
+        where: { eventId, memberId: member.id }
+      });
+      if (alreadyRegistered && Number(alreadyRegistered.id) !== Number(participantId)) {
+        throw new BadRequestException("That member is already registered for this event.");
+      }
+
+      await this.participantsRepo.update(participantId, {
+        memberId: member.id,
+        fullName: `${member.firstName} ${member.lastName}`,
+        email: body.email !== undefined ? body.email || null : member.email ?? existing.email,
+        phone: body.phone !== undefined ? body.phone || null : member.phone ?? existing.phone
+      });
+
+      const created = await this.participantsRepo.findOne({ where: { id: participantId } });
+      const [participant] = await this.enrichParticipants([created!]);
+      return participant;
+    }
+
     let memberId =
       body.memberId !== undefined ? (body.memberId ? Number(body.memberId) : null) : existing.memberId;
 
@@ -993,10 +1036,18 @@ export class EventsService {
       const member = await this.membersRepo.findOne({ where: { id: memberId! } });
       if (!member) throw new NotFoundException("Member not found");
       await this.ensureLifegroupMembership(member.id, lifegroupId);
+      if (churchId) {
+        await this.membersRepo.update(member.id, { churchId });
+      }
     } else {
       const name = this.buildParticipantName(body, existing.fullName);
       if (name.firstName && name.lastName) {
-        const resolved = await this.resolveMemberForRegistration(name.firstName, name.lastName, lifegroupId);
+        const resolved = await this.resolveMemberForRegistration(
+          name.firstName,
+          name.lastName,
+          lifegroupId,
+          churchId
+        );
         memberId = resolved.member.id;
       } else if (existing.memberId && lifegroupId) {
         await this.ensureLifegroupMembership(existing.memberId, lifegroupId);
@@ -1035,24 +1086,97 @@ export class EventsService {
     };
   }
 
-  async linkParticipantsToMembers(eventId: number, body: { participantIds?: number[] } = {}) {
+  private mapLinkCandidate(
+    member: MemberEntity,
+    churchNameById: Map<number, string>,
+    pastorChurchByMemberId: Map<number, ChurchEntity>,
+    lifegroupByMemberId: Map<number, LifeGroupEntity>
+  ) {
+    const lifegroup = lifegroupByMemberId.get(Number(member.id)) || null;
+    const churchId =
+      resolveMemberChurchId(member, pastorChurchByMemberId) ?? lifegroup?.churchId ?? null;
+    return {
+      id: member.id,
+      firstName: member.firstName,
+      lastName: member.lastName,
+      fullName: `${member.firstName} ${member.lastName}`,
+      email: member.email ?? null,
+      phone: member.phone ?? null,
+      churchId,
+      churchName: churchId ? churchNameById.get(Number(churchId)) || null : null,
+      lifegroupName: lifegroup?.name ?? null
+    };
+  }
+
+  private async buildMemberLookupContext(members: MemberEntity[]) {
+    const memberIds = members.map((member) => Number(member.id));
+    const pastorChurchByMemberId = await loadPastorChurchesByMemberId(this.churchesRepo, memberIds);
+
+    const memberships = memberIds.length
+      ? await this.lifeGroupMembersRepo.find({ where: { memberId: In(memberIds) } })
+      : [];
+    const lifegroupIds = [...new Set(memberships.map((row) => Number(row.lifeGroupId)))];
+    const lifegroups = lifegroupIds.length
+      ? await this.lifeGroupsRepo.find({ where: { id: In(lifegroupIds) } })
+      : [];
+    const lifegroupById = new Map(lifegroups.map((group) => [Number(group.id), group]));
+    const lifegroupByMemberId = new Map<number, LifeGroupEntity>();
+    for (const link of memberships) {
+      const group = lifegroupById.get(Number(link.lifeGroupId));
+      if (group && !lifegroupByMemberId.has(Number(link.memberId))) {
+        lifegroupByMemberId.set(Number(link.memberId), group);
+      }
+    }
+
+    const churchIds = [
+      ...new Set(
+        [
+          ...members.map((member) => resolveMemberChurchId(member, pastorChurchByMemberId)),
+          ...lifegroups.map((group) => group.churchId)
+        ]
+          .filter((id) => id != null)
+          .map((id) => Number(id))
+      )
+    ];
+    const churches = churchIds.length ? await this.churchesRepo.find({ where: { id: In(churchIds) } }) : [];
+    const churchNameById = new Map(churches.map((church) => [Number(church.id), getChurchDisplayName(church)]));
+
+    return { pastorChurchByMemberId, lifegroupByMemberId, churchNameById };
+  }
+
+  private async applyParticipantMemberLink(
+    participant: EventParticipantEntity,
+    member: MemberEntity,
+    registeredMemberIds: Set<number>
+  ) {
+    if (registeredMemberIds.has(Number(member.id))) {
+      return { linked: false as const, skipped: true as const };
+    }
+
+    await this.participantsRepo.update(participant.id, {
+      memberId: member.id,
+      fullName: `${member.firstName} ${member.lastName}`,
+      email: member.email ?? participant.email,
+      phone: member.phone ?? participant.phone
+    });
+
+    registeredMemberIds.add(Number(member.id));
+    return { linked: true as const, skipped: false as const };
+  }
+
+  async linkParticipantsToMembers(
+    eventId: number,
+    body: {
+      participantIds?: number[];
+      links?: Array<{ participantId?: number; memberId?: number }>;
+    } = {}
+  ) {
     await this.getEventOrFail(eventId);
 
     const unlinked = await this.participantsRepo.find({
       where: { eventId, memberId: IsNull() }
     });
-
-    const requestedIds = Array.isArray(body.participantIds)
-      ? new Set(body.participantIds.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0))
-      : null;
-
-    const candidates = requestedIds?.size
-      ? unlinked.filter((row) => requestedIds.has(Number(row.id)))
-      : unlinked;
-
-    if (!candidates.length) {
-      return { linked: 0, unmatched: 0, skipped: 0, participants: [], unmatchedNames: [], skippedNames: [] };
-    }
+    const unlinkedById = new Map(unlinked.map((row) => [Number(row.id), row]));
 
     const allParticipants = await this.participantsRepo.find({
       where: { eventId },
@@ -1062,55 +1186,216 @@ export class EventsService {
       allParticipants.map((row) => row.memberId).filter(Boolean).map((id) => Number(id))
     );
 
-    const members = await this.membersRepo.find();
-    const memberByFullName = new Map<string, MemberEntity>();
-    for (const member of members) {
-      const key = this.normalizeParticipantName(`${member.firstName} ${member.lastName}`);
-      if (!memberByFullName.has(key)) {
-        memberByFullName.set(key, member);
-      }
-    }
-
     const linkedRows: number[] = [];
     const unmatchedNames: string[] = [];
     const skippedNames: string[] = [];
+    const needsResolution: Array<{
+      participantId: number;
+      fullName: string;
+      firstName: string | null;
+      lastName: string;
+      candidates: Array<{
+        id: number;
+        firstName: string;
+        lastName: string;
+        fullName: string;
+        email: string | null;
+        phone: string | null;
+        churchId: number | null;
+        churchName: string | null;
+        lifegroupName: string | null;
+      }>;
+    }> = [];
 
-    for (const participant of candidates) {
-      const fullName = participant.fullName?.trim() || "";
-      if (!fullName) {
-        unmatchedNames.push(participant.fullName || `Participant #${participant.id}`);
-        continue;
+    const explicitLinks = Array.isArray(body.links) ? body.links : [];
+    const explicitParticipantIds = new Set<number>();
+
+    if (explicitLinks.length) {
+      const memberIds = [
+        ...new Set(
+          explicitLinks
+            .map((link) => Number(link.memberId))
+            .filter((id) => Number.isFinite(id) && id > 0)
+        )
+      ];
+      const members = memberIds.length
+        ? await this.membersRepo.find({ where: { id: In(memberIds) } })
+        : [];
+      const memberById = new Map(members.map((member) => [Number(member.id), member]));
+
+      for (const link of explicitLinks) {
+        const participantId = Number(link.participantId);
+        const memberId = Number(link.memberId);
+        if (!Number.isFinite(participantId) || participantId <= 0) continue;
+        if (!Number.isFinite(memberId) || memberId <= 0) continue;
+
+        explicitParticipantIds.add(participantId);
+        const participant = unlinkedById.get(participantId);
+        if (!participant) {
+          skippedNames.push(`Participant #${participantId}`);
+          continue;
+        }
+
+        const member = memberById.get(memberId);
+        if (!member) {
+          unmatchedNames.push(participant.fullName || `Participant #${participantId}`);
+          continue;
+        }
+
+        const result = await this.applyParticipantMemberLink(participant, member, registeredMemberIds);
+        if (result.skipped) {
+          skippedNames.push(participant.fullName || `Participant #${participantId}`);
+          continue;
+        }
+        linkedRows.push(participant.id);
+        unlinkedById.delete(participantId);
+      }
+    }
+
+    const requestedIds = Array.isArray(body.participantIds)
+      ? new Set(body.participantIds.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0))
+      : null;
+
+    const autoCandidates = [...unlinkedById.values()].filter((row) => {
+      if (explicitParticipantIds.has(Number(row.id))) return false;
+      if (requestedIds) return requestedIds.has(Number(row.id));
+      // Explicit link confirmation only — do not auto-match the rest of the event.
+      if (explicitLinks.length) return false;
+      return true;
+    });
+
+    if (!autoCandidates.length && !linkedRows.length) {
+      return {
+        linked: 0,
+        unmatched: unmatchedNames.length,
+        skipped: skippedNames.length,
+        needsResolution: [],
+        participants: [],
+        unmatchedNames,
+        skippedNames
+      };
+    }
+
+    if (autoCandidates.length) {
+      const members = await this.membersRepo.find();
+      const memberByFullName = new Map<string, MemberEntity>();
+      const membersByLastName = new Map<string, MemberEntity[]>();
+
+      for (const member of members) {
+        const fullKey = this.normalizeParticipantName(`${member.firstName} ${member.lastName}`);
+        if (!memberByFullName.has(fullKey)) {
+          memberByFullName.set(fullKey, member);
+        }
+
+        const lastKey = this.normalizeParticipantName(member.lastName || "");
+        if (!lastKey) continue;
+        const list = membersByLastName.get(lastKey) || [];
+        list.push(member);
+        membersByLastName.set(lastKey, list);
       }
 
-      const nameKey = this.normalizeParticipantName(fullName);
-      let member = memberByFullName.get(nameKey) || null;
+      const pendingFamily: Array<{
+        participant: EventParticipantEntity;
+        fullName: string;
+        firstName: string | null;
+        lastName: string;
+        familyMatches: MemberEntity[];
+      }> = [];
 
-      if (!member) {
+      for (const participant of autoCandidates) {
+        const fullName = participant.fullName?.trim() || "";
+        if (!fullName) {
+          unmatchedNames.push(participant.fullName || `Participant #${participant.id}`);
+          continue;
+        }
+
+        const nameKey = this.normalizeParticipantName(fullName);
+        let member = memberByFullName.get(nameKey) || null;
         const parsed = this.parseGuestFullName(fullName);
-        if (parsed.firstName && parsed.lastName) {
-          member = await this.findMemberByName(parsed.firstName, parsed.lastName);
+
+        if (!member && parsed.firstName && parsed.lastName) {
+          member =
+            memberByFullName.get(
+              this.normalizeParticipantName(`${parsed.firstName} ${parsed.lastName}`)
+            ) || null;
+        }
+
+        if (!member && parsed.firstName && parsed.lastName) {
+          const exact = (
+            membersByLastName.get(this.normalizeParticipantName(parsed.lastName)) || []
+          ).find(
+            (row) =>
+              this.normalizeParticipantName(row.firstName || "") ===
+              this.normalizeParticipantName(parsed.firstName!)
+          );
+          member = exact || null;
+        }
+
+        if (member) {
+          const result = await this.applyParticipantMemberLink(
+            participant,
+            member,
+            registeredMemberIds
+          );
+          if (result.skipped) {
+            skippedNames.push(fullName);
+            continue;
+          }
+          linkedRows.push(participant.id);
+          continue;
+        }
+
+        const lastName = parsed.lastName || null;
+        if (!lastName) {
+          unmatchedNames.push(fullName);
+          continue;
+        }
+
+        const familyMatches = (
+          membersByLastName.get(this.normalizeParticipantName(lastName)) || []
+        ).filter((row) => !registeredMemberIds.has(Number(row.id)));
+
+        if (!familyMatches.length) {
+          unmatchedNames.push(fullName);
+          continue;
+        }
+
+        pendingFamily.push({
+          participant,
+          fullName,
+          firstName: parsed.firstName,
+          lastName,
+          familyMatches
+        });
+      }
+
+      if (pendingFamily.length) {
+        const lookupMembers = [
+          ...new Map(
+            pendingFamily.flatMap((row) => row.familyMatches).map((member) => [Number(member.id), member])
+          ).values()
+        ];
+        const { pastorChurchByMemberId, lifegroupByMemberId, churchNameById } =
+          await this.buildMemberLookupContext(lookupMembers);
+
+        for (const item of pendingFamily) {
+          needsResolution.push({
+            participantId: Number(item.participant.id),
+            fullName: item.fullName,
+            firstName: item.firstName,
+            lastName: item.lastName,
+            candidates: item.familyMatches
+              .map((row) =>
+                this.mapLinkCandidate(row, churchNameById, pastorChurchByMemberId, lifegroupByMemberId)
+              )
+              .sort((a, b) =>
+                String(a.fullName || "").localeCompare(String(b.fullName || ""), undefined, {
+                  sensitivity: "base"
+                })
+              )
+          });
         }
       }
-
-      if (!member) {
-        unmatchedNames.push(fullName);
-        continue;
-      }
-
-      if (registeredMemberIds.has(Number(member.id))) {
-        skippedNames.push(fullName);
-        continue;
-      }
-
-      await this.participantsRepo.update(participant.id, {
-        memberId: member.id,
-        fullName: `${member.firstName} ${member.lastName}`,
-        email: member.email ?? participant.email,
-        phone: member.phone ?? participant.phone
-      });
-
-      registeredMemberIds.add(Number(member.id));
-      linkedRows.push(participant.id);
     }
 
     const refreshed = linkedRows.length
@@ -1122,6 +1407,7 @@ export class EventsService {
       linked: participants.length,
       unmatched: unmatchedNames.length,
       skipped: skippedNames.length,
+      needsResolution,
       participants,
       unmatchedNames,
       skippedNames
