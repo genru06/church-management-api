@@ -1188,6 +1188,20 @@ export class EventsService {
     return { ...this.mapParticipant(updated!), alreadyCheckedIn: false };
   }
 
+  async cancelCheckIn(eventId: number, participantId: number) {
+    await this.getEventOrFail(eventId);
+    const participant = await this.participantsRepo.findOne({ where: { id: participantId, eventId } });
+    if (!participant) throw new NotFoundException("Participant not found");
+
+    if (!participant.attendedAt) {
+      return { ...this.mapParticipant(participant), alreadyCancelled: true };
+    }
+
+    await this.participantsRepo.update(participant.id, { attendedAt: null });
+    const updated = await this.participantsRepo.findOne({ where: { id: participant.id } });
+    return { ...this.mapParticipant(updated!), alreadyCancelled: false };
+  }
+
   async payRegistration(eventId: number, participantId: number, body: any) {
     const event = await this.getEventOrFail(eventId);
     const fee = Number(event.registrationFee || 0);
