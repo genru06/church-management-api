@@ -95,6 +95,7 @@ export class EventsService {
       location: row.location,
       description: row.description,
       expectedParticipants: row.expectedParticipants,
+      reservedParticipants: row.reservedParticipants != null ? Number(row.reservedParticipants) : 0,
       registrationFee: row.registrationFee ? Number(row.registrationFee) : 0,
       status: row.status,
       eventType: row.eventType,
@@ -1260,11 +1261,11 @@ export class EventsService {
     return { id: pledgeId, deleted: true };
   }
 
-  private async syncExpectedParticipantsFromReservations(eventId: number) {
+  private async syncReservedParticipantsFromReservations(eventId: number) {
     const rows = await this.reservationsRepo.find({ where: { eventId } });
     const total = rows.reduce((sum, row) => sum + Number(row.reservedCount || 0), 0);
     await this.eventsRepo.update(eventId, {
-      expectedParticipants: rows.length ? total : null
+      reservedParticipants: total
     });
     return total;
   }
@@ -1310,7 +1311,7 @@ export class EventsService {
         notes: null
       })
     );
-    await this.syncExpectedParticipantsFromReservations(eventId);
+    await this.syncReservedParticipantsFromReservations(eventId);
     const [mapped] = await this.enrichReservations([saved]);
     return mapped;
   }
@@ -1345,7 +1346,7 @@ export class EventsService {
       reservedCount,
       notes: null
     });
-    await this.syncExpectedParticipantsFromReservations(eventId);
+    await this.syncReservedParticipantsFromReservations(eventId);
 
     const updated = await this.reservationsRepo.findOne({ where: { id: reservationId } });
     const [mapped] = await this.enrichReservations([updated!]);
@@ -1369,7 +1370,7 @@ export class EventsService {
     const existing = await this.reservationsRepo.findOne({ where: { id: reservationId, eventId } });
     if (!existing) throw new NotFoundException("Reservation not found");
     await this.reservationsRepo.delete(reservationId);
-    await this.syncExpectedParticipantsFromReservations(eventId);
+    await this.syncReservedParticipantsFromReservations(eventId);
     return { id: reservationId, deleted: true };
   }
 
@@ -1387,7 +1388,10 @@ export class EventsService {
       .reduce((sum, p) => sum + (p.registrationAmount || 0), 0);
     const pledgesCollected = pledges.filter((p) => p.paid).reduce((sum, p) => sum + p.amount, 0);
     const pledgesTotal = pledges.reduce((sum, p) => sum + p.amount, 0);
-    const reservedTotal = reservations.reduce((sum, row) => sum + row.reservedCount, 0);
+    const reservedTotal =
+      event.reservedParticipants != null
+        ? Number(event.reservedParticipants)
+        : reservations.reduce((sum, row) => sum + row.reservedCount, 0);
 
     return {
       event,
@@ -1398,9 +1402,7 @@ export class EventsService {
         participantCount: participants.length,
         adultCount,
         kidsCount,
-        expectedParticipants: reservations.length
-          ? reservedTotal
-          : event.expectedParticipants || 0,
+        expectedParticipants: event.expectedParticipants || 0,
         reservedTotal,
         attendedCount,
         attendanceRate: participants.length ? Math.round((attendedCount / participants.length) * 100) : 0,

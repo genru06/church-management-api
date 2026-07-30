@@ -23,6 +23,9 @@ export class EventEntity {
   @Column({ name: "expected_participants", type: "int", unsigned: true, nullable: true })
   expectedParticipants: number | null;
 
+  @Column({ name: "reserved_participants", type: "int", unsigned: true, nullable: true, default: 0 })
+  reservedParticipants: number | null;
+
   @Column({ name: "registration_fee", type: "decimal", precision: 10, scale: 2, nullable: true, default: 0 })
   registrationFee: string | null;
 
