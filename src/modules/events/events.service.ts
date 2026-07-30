@@ -1131,6 +1131,16 @@ export class EventsService {
   async checkIn(eventId: number, body: any) {
     const event = await this.getEventOrFail(eventId);
     const token = body.token?.trim();
+    const memberId = body.memberId != null && body.memberId !== "" ? Number(body.memberId) : NaN;
+    const isManualMemberId =
+      String(body.type || "").toLowerCase() === "manual" ||
+      (Number.isFinite(memberId) && memberId > 0 && !token && !body.participantId);
+
+    // Staff manual check-in by member ID (no QR token required)
+    if (isManualMemberId) {
+      return this.checkInMember(event, memberId);
+    }
+
     if (!token) throw new BadRequestException("Invalid check-in payload");
 
     // Member identity QR (works across all events)
@@ -1158,6 +1168,17 @@ export class EventsService {
     if (!member.qrToken || member.qrToken !== token) {
       throw new BadRequestException("Invalid QR token");
     }
+
+    return this.checkInMember(event, member.id, member);
+  }
+
+  private async checkInMember(event: EventEntity, memberId: number, memberEntity?: MemberEntity | null) {
+    if (!Number.isFinite(memberId) || memberId <= 0) {
+      throw new BadRequestException("Invalid member ID");
+    }
+
+    const member = memberEntity || (await this.membersRepo.findOne({ where: { id: memberId } }));
+    if (!member) throw new NotFoundException("Member not found");
 
     let participant = await this.participantsRepo.findOne({
       where: { eventId: event.id, memberId: member.id }
