@@ -1486,29 +1486,33 @@ export class EventsService {
   }
 
   private async checkInByMemberQr(event: EventEntity, memberId: number, token: string) {
-    if (!Number.isFinite(memberId) || memberId <= 0) {
+    const resolvedMemberId = Number(memberId);
+    if (!Number.isFinite(resolvedMemberId) || resolvedMemberId <= 0) {
       throw new BadRequestException("Invalid check-in payload");
     }
 
-    const member = await this.membersRepo.findOne({ where: { id: memberId } });
+    const member = await this.membersRepo.findOne({ where: { id: resolvedMemberId } });
     if (!member) throw new NotFoundException("Member not found");
     if (!member.qrToken || member.qrToken !== token) {
       throw new BadRequestException("Invalid QR token");
     }
 
-    return this.checkInMember(event, member.id, member);
+    return this.checkInMember(event, Number(member.id), member);
   }
 
   private async checkInMember(event: EventEntity, memberId: number, memberEntity?: MemberEntity | null) {
-    if (!Number.isFinite(memberId) || memberId <= 0) {
+    // MySQL bigint IDs often arrive as strings — coerce before Number.isFinite checks.
+    const resolvedMemberId = Number(memberId);
+    if (!Number.isFinite(resolvedMemberId) || resolvedMemberId <= 0) {
       throw new BadRequestException("Invalid member ID");
     }
 
-    const member = memberEntity || (await this.membersRepo.findOne({ where: { id: memberId } }));
+    const member =
+      memberEntity || (await this.membersRepo.findOne({ where: { id: resolvedMemberId } }));
     if (!member) throw new NotFoundException("Member not found");
 
     let participant = await this.participantsRepo.findOne({
-      where: { eventId: event.id, memberId: member.id }
+      where: { eventId: event.id, memberId: Number(member.id) }
     });
 
     if (!participant) {
@@ -1519,7 +1523,7 @@ export class EventsService {
         });
       }
       const created = await this.createEventParticipant(event, member);
-      participant = await this.participantsRepo.findOne({ where: { id: created.id } });
+      participant = await this.participantsRepo.findOne({ where: { id: Number(created.id) } });
       if (!participant) throw new NotFoundException("Participant not found");
     }
 
@@ -1531,9 +1535,9 @@ export class EventsService {
       return { ...this.mapParticipant(participant), alreadyCheckedIn: true };
     }
 
-    await this.participantsRepo.update(participant.id, { attendedAt: new Date() });
-    const updated = await this.participantsRepo.findOne({ where: { id: participant.id } });
-    return { ...this.mapParticipant(updated!), alreadyCheckedIn: false };
+    participant.attendedAt = new Date();
+    const updated = await this.participantsRepo.save(participant);
+    return { ...this.mapParticipant(updated), alreadyCheckedIn: false };
   }
 
   async cancelCheckIn(eventId: number, participantId: number) {
@@ -1545,9 +1549,9 @@ export class EventsService {
       return { ...this.mapParticipant(participant), alreadyCancelled: true };
     }
 
-    await this.participantsRepo.update(participant.id, { attendedAt: null });
-    const updated = await this.participantsRepo.findOne({ where: { id: participant.id } });
-    return { ...this.mapParticipant(updated!), alreadyCancelled: false };
+    participant.attendedAt = null;
+    const updated = await this.participantsRepo.save(participant);
+    return { ...this.mapParticipant(updated), alreadyCancelled: false };
   }
 
   async payRegistration(eventId: number, participantId: number, body: any) {
