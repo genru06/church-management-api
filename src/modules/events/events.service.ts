@@ -1026,6 +1026,11 @@ export class EventsService {
     const existing = await this.participantsRepo.findOne({ where: { id: participantId, eventId } });
     if (!existing) throw new NotFoundException("Participant not found");
 
+    const placement = body.placement === "church" || body.placement === "guest" ? body.placement : null;
+    if (placement) {
+      return this.reassignLinkedParticipant(eventId, existing, body, placement);
+    }
+
     const lifegroupId = body.lifegroupId ? Number(body.lifegroupId) : null;
     const churchId = body.churchId ? Number(body.churchId) : null;
     const addAsMember = !!body.addAsMember;
@@ -1106,6 +1111,87 @@ export class EventsService {
     });
 
     const updated = await this.participantsRepo.findOne({ where: { id: participantId } });
+    const [participant] = await this.enrichParticipants([updated!]);
+    return participant;
+  }
+
+  private async reassignLinkedParticipant(
+    eventId: number,
+    existing: EventParticipantEntity,
+    body: any,
+    placement: "church" | "guest"
+  ) {
+    if (!existing.memberId) {
+      throw new BadRequestException("Only linked members can be reassigned from Unassigned.");
+    }
+
+    const member = await this.membersRepo.findOne({ where: { id: existing.memberId } });
+    if (!member) throw new NotFoundException("Member not found");
+
+    const firstName = String(body.firstName ?? member.firstName ?? "").trim();
+    const lastName = String(body.lastName ?? member.lastName ?? "").trim();
+    if (!firstName || !lastName) {
+      throw new BadRequestException("First name and last name are required");
+    }
+
+    const email =
+      body.email !== undefined ? String(body.email || "").trim() || null : member.email ?? existing.email;
+    const phone =
+      body.phone !== undefined ? String(body.phone || "").trim() || null : member.phone ?? existing.phone;
+    const fullName = `${firstName} ${lastName}`;
+
+    if (placement === "church") {
+      const churchId = body.churchId ? Number(body.churchId) : null;
+      if (!churchId) {
+        throw new BadRequestException("Church is required when assigning to a church.");
+      }
+      await this.validateChurchAndLifeGroup(churchId, null);
+
+      await this.membersRepo.update(member.id, {
+        firstName,
+        lastName,
+        email,
+        phone,
+        churchId
+      });
+      await this.participantsRepo.update(existing.id, {
+        fullName,
+        email,
+        phone,
+        reservationId: null
+      });
+    } else {
+      const reservationId = body.reservationId ? Number(body.reservationId) : null;
+      if (!reservationId) {
+        throw new BadRequestException("Guest list is required when moving to a reservation.");
+      }
+
+      const reservation = await this.reservationsRepo.findOne({ where: { id: reservationId, eventId } });
+      if (!reservation) throw new NotFoundException("Reservation list not found");
+      if (reservation.churchId) {
+        throw new BadRequestException("Select a guest reservation list (not a church reservation).");
+      }
+
+      if (Number(existing.reservationId || 0) !== reservationId) {
+        await this.assertReservationHasCapacity(eventId, reservationId, 1, reservation);
+      }
+
+      await this.membersRepo.update(member.id, {
+        firstName,
+        lastName,
+        email,
+        phone,
+        churchId: null
+      });
+      await this.participantsRepo.update(existing.id, {
+        fullName,
+        email,
+        phone,
+        reservationId
+      });
+    }
+
+    const updated = await this.participantsRepo.findOne({ where: { id: existing.id } });
     const [participant] = await this.enrichParticipants([updated!]);
     return participant;
   }
@@ -1823,8 +1909,13 @@ export class EventsService {
     const reservations = await this.listReservations(eventId);
 
     const attendedCount = participants.filter((p) => p.attendedAt).length;
-    const kidsCount = participants.filter((p) => p.isKid).length;
-    const adultCount = participants.length - kidsCount;
+    // Guest-reservation names are covered by reserved slots — keep them out of
+    // registered / adults / kids so they are not double-counted with reserved.
+    const registeredParticipants = participants.filter(
+      (p) => !(p.reservationId && !p.churchId)
+    );
+    const kidsCount = registeredParticipants.filter((p) => p.isKid).length;
+    const adultCount = registeredParticipants.length - kidsCount;
     const registrationCollected = participants
       .filter((p) => p.registrationPaid)
       .reduce((sum, p) => sum + (p.registrationAmount || 0), 0);
@@ -1841,7 +1932,7 @@ export class EventsService {
       pledges,
       reservations,
       stats: {
-        participantCount: participants.length,
+        participantCount: registeredParticipants.length,
         adultCount,
         kidsCount,
         expectedParticipants: event.expectedParticipants || 0,
