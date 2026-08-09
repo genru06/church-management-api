@@ -1031,6 +1031,47 @@ export class EventsService {
       return this.reassignLinkedParticipant(eventId, existing, body, placement);
     }
 
+    if (body.transferReservationId !== undefined && body.transferReservationId !== null) {
+      return this.transferGuestToReservation(eventId, existing, Number(body.transferReservationId), body);
+    }
+
+    // Pure reservation guests stay as guests when editing details (no auto member link).
+    if (!existing.memberId && existing.reservationId && body.memberId === undefined && !body.addAsMember) {
+      const fullName = body.fullName?.trim() || existing.fullName;
+      if (!fullName) {
+        throw new BadRequestException("Participant full name is required");
+      }
+
+      const currentReservationId = Number(existing.reservationId);
+      if (this.normalizeParticipantName(fullName) !== this.normalizeParticipantName(existing.fullName)) {
+        const conflict = await this.findGuestNameConflictOutsideReservation(
+          eventId,
+          fullName,
+          currentReservationId,
+          Number(existing.id)
+        );
+        if (conflict) {
+          const conflictReservation = await this.reservationsRepo.findOne({
+            where: { id: Number(conflict.reservationId) }
+          });
+          const listLabel = conflictReservation?.label || "another guest list";
+          throw new BadRequestException(
+            `${fullName.trim()} already exists on ${listLabel}. Rename blocked.`
+          );
+        }
+      }
+
+      await this.participantsRepo.update(participantId, {
+        fullName,
+        email: body.email !== undefined ? body.email || null : existing.email,
+        phone: body.phone !== undefined ? body.phone || null : existing.phone
+      });
+
+      const updatedGuest = await this.participantsRepo.findOne({ where: { id: participantId } });
+      const [guestParticipant] = await this.enrichParticipants([updatedGuest!]);
+      return guestParticipant;
+    }
+
     const lifegroupId = body.lifegroupId ? Number(body.lifegroupId) : null;
     const churchId = body.churchId ? Number(body.churchId) : null;
     const addAsMember = !!body.addAsMember;
@@ -1115,30 +1156,127 @@ export class EventsService {
     return participant;
   }
 
+  private async findGuestNameConflictOutsideReservation(
+    eventId: number,
+    fullName: string,
+    excludeReservationId: number | null,
+    excludeParticipantId: number
+  ) {
+    const normalized = this.normalizeParticipantName(fullName);
+    if (!normalized) return null;
+
+    const guests = await this.participantsRepo
+      .createQueryBuilder("participant")
+      .where("participant.eventId = :eventId", { eventId })
+      .andWhere("participant.memberId IS NULL")
+      .andWhere("participant.id != :excludeParticipantId", { excludeParticipantId })
+      .andWhere("participant.reservationId IS NOT NULL")
+      .getMany();
+
+    const guestReservations = await this.reservationsRepo.find({ where: { eventId } });
+    const guestReservationIds = new Set(
+      guestReservations
+        .filter((row) => !row.churchId)
+        .map((row) => Number(row.id))
+    );
+
+    return (
+      guests.find((row) => {
+        const reservationId = row.reservationId != null ? Number(row.reservationId) : null;
+        if (!reservationId || !guestReservationIds.has(reservationId)) return false;
+        if (excludeReservationId != null && reservationId === Number(excludeReservationId)) {
+          return false;
+        }
+        return this.normalizeParticipantName(row.fullName) === normalized;
+      }) || null
+    );
+  }
+
+  private async transferGuestToReservation(
+    eventId: number,
+    existing: EventParticipantEntity,
+    targetReservationId: number,
+    body: any = {}
+  ) {
+    if (existing.memberId) {
+      throw new BadRequestException("Linked members cannot be transferred between guest lists this way.");
+    }
+
+    if (!existing.reservationId) {
+      throw new BadRequestException("Only guests on a reservation list can be transferred.");
+    }
+
+    const currentReservationId = Number(existing.reservationId);
+    if (currentReservationId === targetReservationId) {
+      throw new BadRequestException("Participant is already on that guest list.");
+    }
+
+    const targetReservation = await this.reservationsRepo.findOne({
+      where: { id: targetReservationId, eventId }
+    });
+    if (!targetReservation) throw new NotFoundException("Guest list not found");
+    if (targetReservation.churchId) {
+      throw new BadRequestException("Select a guest reservation list (not a church reservation).");
+    }
+
+    const nextFullName =
+      body.fullName !== undefined ? String(body.fullName || "").trim() || existing.fullName : existing.fullName;
+
+    const conflict = await this.findGuestNameConflictOutsideReservation(
+      eventId,
+      nextFullName,
+      currentReservationId,
+      Number(existing.id)
+    );
+    if (conflict) {
+      const conflictReservation = await this.reservationsRepo.findOne({
+        where: { id: Number(conflict.reservationId) }
+      });
+      const listLabel = conflictReservation?.label || "another guest list";
+      throw new BadRequestException(
+        `${nextFullName.trim()} already exists on ${listLabel}. Transfer blocked.`
+      );
+    }
+
+    await this.assertReservationHasCapacity(eventId, targetReservationId, 1, targetReservation);
+
+    await this.participantsRepo.update(existing.id, {
+      reservationId: targetReservationId,
+      fullName: nextFullName,
+      email: body.email !== undefined ? body.email || null : existing.email,
+      phone: body.phone !== undefined ? body.phone || null : existing.phone
+    });
+
+    const updated = await this.participantsRepo.findOne({ where: { id: existing.id } });
+    const [participant] = await this.enrichParticipants([updated!]);
+    return participant;
+  }
+
   private async reassignLinkedParticipant(
     eventId: number,
     existing: EventParticipantEntity,
     body: any,
     placement: "church" | "guest"
   ) {
-    if (!existing.memberId) {
-      throw new BadRequestException("Only linked members can be reassigned from Unassigned.");
-    }
-
-    const member = await this.membersRepo.findOne({ where: { id: existing.memberId } });
-    if (!member) throw new NotFoundException("Member not found");
-
-    const firstName = String(body.firstName ?? member.firstName ?? "").trim();
-    const lastName = String(body.lastName ?? member.lastName ?? "").trim();
+    const firstName = String(body.firstName ?? "").trim();
+    const lastName = String(body.lastName ?? "").trim();
     if (!firstName || !lastName) {
       throw new BadRequestException("First name and last name are required");
     }
 
     const email =
-      body.email !== undefined ? String(body.email || "").trim() || null : member.email ?? existing.email;
+      body.email !== undefined ? String(body.email || "").trim() || null : existing.email;
     const phone =
-      body.phone !== undefined ? String(body.phone || "").trim() || null : member.phone ?? existing.phone;
+      body.phone !== undefined ? String(body.phone || "").trim() || null : existing.phone;
     const fullName = `${firstName} ${lastName}`;
+
+    let member = existing.memberId
+      ? await this.membersRepo.findOne({ where: { id: existing.memberId } })
+      : null;
+
+    if (existing.memberId && !member) {
+      throw new NotFoundException("Member not found");
+    }
 
     if (placement === "church") {
       const churchId = body.churchId ? Number(body.churchId) : null;
@@ -1147,19 +1285,46 @@ export class EventsService {
       }
       await this.validateChurchAndLifeGroup(churchId, null);
 
-      await this.membersRepo.update(member.id, {
-        firstName,
-        lastName,
-        email,
-        phone,
-        churchId
-      });
-      await this.participantsRepo.update(existing.id, {
-        fullName,
-        email,
-        phone,
-        reservationId: null
-      });
+      if (member) {
+        await this.membersRepo.update(member.id, {
+          firstName,
+          lastName,
+          email: email ?? member.email ?? null,
+          phone: phone ?? member.phone ?? null,
+          churchId
+        });
+        await this.participantsRepo.update(existing.id, {
+          fullName,
+          email,
+          phone,
+          reservationId: null
+        });
+      } else {
+        const resolved = await this.resolveMemberForRegistration(firstName, lastName, null, churchId);
+        member = resolved.member;
+
+        const alreadyRegistered = await this.participantsRepo.findOne({
+          where: { eventId, memberId: member.id }
+        });
+        if (alreadyRegistered && Number(alreadyRegistered.id) !== Number(existing.id)) {
+          throw new BadRequestException("That member is already registered for this event.");
+        }
+
+        await this.membersRepo.update(member.id, {
+          firstName,
+          lastName,
+          email: email ?? member.email ?? null,
+          phone: phone ?? member.phone ?? null,
+          churchId
+        });
+        await this.participantsRepo.update(existing.id, {
+          memberId: member.id,
+          fullName,
+          email,
+          phone,
+          reservationId: null
+        });
+      }
     } else {
       const reservationId = body.reservationId ? Number(body.reservationId) : null;
       if (!reservationId) {
@@ -1172,23 +1337,50 @@ export class EventsService {
         throw new BadRequestException("Select a guest reservation list (not a church reservation).");
       }
 
-      if (Number(existing.reservationId || 0) !== reservationId) {
+      const currentReservationId = existing.reservationId != null ? Number(existing.reservationId) : null;
+      if (currentReservationId !== reservationId) {
         await this.assertReservationHasCapacity(eventId, reservationId, 1, reservation);
       }
 
-      await this.membersRepo.update(member.id, {
-        firstName,
-        lastName,
-        email,
-        phone,
-        churchId: null
-      });
-      await this.participantsRepo.update(existing.id, {
+      const conflict = await this.findGuestNameConflictOutsideReservation(
+        eventId,
         fullName,
-        email,
-        phone,
-        reservationId
-      });
+        currentReservationId,
+        Number(existing.id)
+      );
+      if (conflict) {
+        const conflictReservation = await this.reservationsRepo.findOne({
+          where: { id: Number(conflict.reservationId) }
+        });
+        const listLabel = conflictReservation?.label || "another guest list";
+        throw new BadRequestException(
+          `${fullName.trim()} already exists on ${listLabel}. Transfer blocked.`
+        );
+      }
+
+      if (member) {
+        await this.membersRepo.update(member.id, {
+          firstName,
+          lastName,
+          email: email ?? member.email ?? null,
+          phone: phone ?? member.phone ?? null,
+          churchId: null
+        });
+        await this.participantsRepo.update(existing.id, {
+          fullName,
+          email,
+          phone,
+          reservationId
+        });
+      } else {
+        await this.participantsRepo.update(existing.id, {
+          memberId: null,
+          fullName,
+          email,
+          phone,
+          reservationId
+        });
+      }
     }
 
     const updated = await this.participantsRepo.findOne({ where: { id: existing.id } });
