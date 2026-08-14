@@ -5,6 +5,7 @@ import { MemberEntity } from "../../entities/member.entity";
 import { ChurchEntity } from "../../entities/church.entity";
 import { LifeGroupEntity } from "../../entities/lifegroup.entity";
 import { EventEntity } from "../../entities/event.entity";
+import { LG_NETWORK_CHURCH_TAG } from "../../utils/church-tags";
 
 @Injectable()
 export class DashboardService {
@@ -16,9 +17,9 @@ export class DashboardService {
   ) {}
 
   async getDashboard() {
-    const [memberCount, churchCount, lifeGroupCount, kidsRow, upcomingEvents] = await Promise.all([
+    const [memberCount, churchCounts, lifeGroupCount, kidsRow, upcomingEvents] = await Promise.all([
       this.membersRepo.count(),
-      this.churchesRepo.count(),
+      this.loadChurchCounts(),
       this.lifeGroupsRepo.count(),
       this.membersRepo.query(
         `SELECT COUNT(DISTINCT m.id) AS count
@@ -30,11 +31,47 @@ export class DashboardService {
     ]);
     return {
       totalMembers: memberCount,
-      totalChurches: churchCount,
+      totalChurches: churchCounts.totalChurches,
+      totalNetworkChurches: churchCounts.totalNetworkChurches,
       totalLifeGroups: lifeGroupCount,
       totalKids: Number(kidsRow?.[0]?.count || 0),
       upcomingEvents
     };
+  }
+
+  private async loadChurchCounts() {
+    try {
+      const [allRow, networkRow] = await Promise.all([
+        this.churchesRepo.query(
+          `SELECT COUNT(*) AS count
+           FROM church c
+           WHERE NOT EXISTS (
+             SELECT 1
+             FROM church_tag ct
+             INNER JOIN tag t ON t.id = ct.tag_id AND LOWER(t.name) = ?
+             WHERE ct.church_id = c.id
+           )`,
+          [LG_NETWORK_CHURCH_TAG.toLowerCase()]
+        ),
+        this.churchesRepo.query(
+          `SELECT COUNT(DISTINCT c.id) AS count
+           FROM church c
+           INNER JOIN church_tag ct ON ct.church_id = c.id
+           INNER JOIN tag t ON t.id = ct.tag_id AND LOWER(t.name) = ?`,
+          [LG_NETWORK_CHURCH_TAG.toLowerCase()]
+        )
+      ]);
+      return {
+        totalChurches: Number(allRow?.[0]?.count || 0),
+        totalNetworkChurches: Number(networkRow?.[0]?.count || 0)
+      };
+    } catch (err: any) {
+      if (err?.code === "ER_NO_SUCH_TABLE") {
+        const churchCount = await this.churchesRepo.count();
+        return { totalChurches: churchCount, totalNetworkChurches: 0 };
+      }
+      throw err;
+    }
   }
 
   private async loadUpcomingEvents() {

@@ -1735,6 +1735,7 @@ export class EventsService {
 
   async checkIn(eventId: number, body: any) {
     const event = await this.getEventOrFail(eventId);
+    const overrideUnpaid = body?.overrideUnpaid === true || body?.override === true;
     const token = body.token?.trim();
     const memberId = body.memberId != null && body.memberId !== "" ? Number(body.memberId) : NaN;
     const isManualMemberId =
@@ -1743,14 +1744,14 @@ export class EventsService {
 
     // Staff manual check-in by member ID (no QR token required)
     if (isManualMemberId) {
-      return this.checkInMember(event, memberId);
+      return this.checkInMember(event, memberId, undefined, overrideUnpaid);
     }
 
     if (!token) throw new BadRequestException("Invalid check-in payload");
 
     // Member identity QR (works across all events)
     if (body.type === "member" || body.memberId) {
-      return this.checkInByMemberQr(event, Number(body.memberId), token);
+      return this.checkInByMemberQr(event, Number(body.memberId), token, overrideUnpaid);
     }
 
     // Legacy / guest participant QR (scoped to one registration)
@@ -1760,10 +1761,15 @@ export class EventsService {
     const participant = await this.participantsRepo.findOne({ where: { id: participantId, eventId } });
     if (!participant) throw new NotFoundException("Participant not found");
     if (participant.qrToken !== token) throw new BadRequestException("Invalid QR token");
-    return this.markParticipantAttended(participant);
+    return this.markParticipantAttended(event, participant, overrideUnpaid);
   }
 
-  private async checkInByMemberQr(event: EventEntity, memberId: number, token: string) {
+  private async checkInByMemberQr(
+    event: EventEntity,
+    memberId: number,
+    token: string,
+    overrideUnpaid = false
+  ) {
     const resolvedMemberId = Number(memberId);
     if (!Number.isFinite(resolvedMemberId) || resolvedMemberId <= 0) {
       throw new BadRequestException("Invalid check-in payload");
@@ -1775,10 +1781,15 @@ export class EventsService {
       throw new BadRequestException("Invalid QR token");
     }
 
-    return this.checkInMember(event, Number(member.id), member);
+    return this.checkInMember(event, Number(member.id), member, overrideUnpaid);
   }
 
-  private async checkInMember(event: EventEntity, memberId: number, memberEntity?: MemberEntity | null) {
+  private async checkInMember(
+    event: EventEntity,
+    memberId: number,
+    memberEntity?: MemberEntity | null,
+    overrideUnpaid = false
+  ) {
     // MySQL bigint IDs often arrive as strings — coerce before Number.isFinite checks.
     const resolvedMemberId = Number(memberId);
     if (!Number.isFinite(resolvedMemberId) || resolvedMemberId <= 0) {
@@ -1805,12 +1816,29 @@ export class EventsService {
       if (!participant) throw new NotFoundException("Participant not found");
     }
 
-    return this.markParticipantAttended(participant);
+    return this.markParticipantAttended(event, participant, overrideUnpaid);
   }
 
-  private async markParticipantAttended(participant: EventParticipantEntity) {
+  private isPaidEvent(event: EventEntity) {
+    return Number(event.registrationFee || 0) > 0;
+  }
+
+  private async markParticipantAttended(
+    event: EventEntity,
+    participant: EventParticipantEntity,
+    overrideUnpaid = false
+  ) {
     if (participant.attendedAt) {
       return { ...this.mapParticipant(participant), alreadyCheckedIn: true };
+    }
+
+    if (this.isPaidEvent(event) && !participant.registrationPaid && !overrideUnpaid) {
+      const mapped = this.mapParticipant(participant);
+      throw new BadRequestException({
+        code: "UNPAID",
+        message: `${mapped.fullName || "This participant"} has not paid the registration fee.`,
+        participant: mapped
+      });
     }
 
     participant.attendedAt = new Date();

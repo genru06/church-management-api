@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Post, Put } from "@nestjs/common";
+import { Body, Controller, Delete, Get, Param, Post, Put, Query } from "@nestjs/common";
 import { ChurchesService } from "./churches.service";
 
 @Controller("churches")
@@ -11,8 +11,8 @@ export class ChurchesController {
   }
 
   @Get()
-  list() {
-    return this.churchesService.list();
+  list(@Query("tag") tag?: string | string[], @Query("excludeTag") excludeTag?: string | string[]) {
+    return this.churchesService.list(tag, excludeTag);
   }
 
   @Get(":id/members")

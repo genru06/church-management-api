@@ -63,7 +63,12 @@ export class MembersService {
     return this.view(saved.id);
   }
 
-  async list(search?: string, tag?: string | string[], lifeGroupId?: string | string[]) {
+  async list(
+    search?: string,
+    tag?: string | string[],
+    lifeGroupId?: string | string[],
+    churchTag?: string | string[]
+  ) {
     const qb = this.membersRepo.createQueryBuilder("member")
       .orderBy("member.lastName", "ASC")
       .addOrderBy("member.firstName", "ASC");
@@ -84,6 +89,13 @@ export class MembersService {
       const lifeGroupMemberIds = await this.getMemberIdsByLifeGroupIds(lifeGroupIds);
       if (!lifeGroupMemberIds.length) return [];
       qb.andWhere("member.id IN (:...lifeGroupMemberIds)", { lifeGroupMemberIds });
+    }
+
+    const churchTagTerms = this.normalizeTagFilter(churchTag);
+    if (churchTagTerms.length) {
+      const churchMemberIds = await this.getMemberIdsByChurchTagNames(churchTagTerms);
+      if (!churchMemberIds.length) return [];
+      qb.andWhere("member.id IN (:...churchMemberIds)", { churchMemberIds });
     }
 
     const rows = await qb.getMany();
@@ -460,6 +472,48 @@ export class MembersService {
       tagNames.map((name) => name.toLowerCase())
     );
     return rows.map((row: { id: string | number }) => Number(row.id));
+  }
+
+  private async getMemberIdsByChurchTagNames(tagNames: string[]) {
+    if (!tagNames.length) return [];
+
+    const placeholders = tagNames.map(() => "?").join(",");
+    const lowered = tagNames.map((name) => name.toLowerCase());
+    try {
+      const rows = await this.membersRepo.query(
+        `SELECT DISTINCT memberId AS id FROM (
+           SELECT m.id AS memberId
+           FROM member m
+           INNER JOIN church_tag ct ON ct.church_id = m.church_id
+           INNER JOIN tag t ON t.id = ct.tag_id AND LOWER(t.name) IN (${placeholders})
+           UNION
+           SELECT c.pastor_member_id AS memberId
+           FROM church c
+           INNER JOIN church_tag ct ON ct.church_id = c.id
+           INNER JOIN tag t ON t.id = ct.tag_id AND LOWER(t.name) IN (${placeholders})
+           WHERE c.pastor_member_id IS NOT NULL
+           UNION
+           SELECT lg.coach_member_id AS memberId
+           FROM lifegroup lg
+           INNER JOIN church_tag ct ON ct.church_id = lg.church_id
+           INNER JOIN tag t ON t.id = ct.tag_id AND LOWER(t.name) IN (${placeholders})
+           WHERE lg.coach_member_id IS NOT NULL
+           UNION
+           SELECT lm.member_id AS memberId
+           FROM lifegroup_member lm
+           INNER JOIN lifegroup lg ON lg.id = lm.lifegroup_id
+           INNER JOIN church_tag ct ON ct.church_id = lg.church_id
+           INNER JOIN tag t ON t.id = ct.tag_id AND LOWER(t.name) IN (${placeholders})
+         ) linked
+         WHERE memberId IS NOT NULL
+         ORDER BY memberId DESC`,
+        [...lowered, ...lowered, ...lowered, ...lowered]
+      );
+      return rows.map((row: { id: string | number }) => Number(row.id));
+    } catch (err: any) {
+      if (err?.code === "ER_NO_SUCH_TABLE") return [];
+      throw err;
+    }
   }
 
   private async getMemberIdsByLifeGroupIds(lifeGroupIds: number[]) {

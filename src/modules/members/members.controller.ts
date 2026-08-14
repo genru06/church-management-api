@@ -19,9 +19,10 @@ export class MembersController {
   list(
     @Query("search") search?: string,
     @Query("tag") tag?: string | string[],
-    @Query("lifeGroupId") lifeGroupId?: string | string[]
+    @Query("lifeGroupId") lifeGroupId?: string | string[],
+    @Query("churchTag") churchTag?: string | string[]
   ) {
-    return this.membersService.list(search, tag, lifeGroupId);
+    return this.membersService.list(search, tag, lifeGroupId, churchTag);
   }
 
   @Get(":id")

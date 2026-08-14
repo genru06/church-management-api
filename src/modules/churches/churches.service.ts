@@ -7,6 +7,7 @@ import { MemberEntity } from "../../entities/member.entity";
 import { LifeGroupEntity } from "../../entities/lifegroup.entity";
 import { TagEntity } from "../../entities/tag.entity";
 import { sortChurchesMainFirst } from "../../utils/church-display";
+import { LG_NETWORK_CHURCH_TAG } from "../../utils/church-tags";
 
 @Injectable()
 export class ChurchesService {
@@ -35,8 +36,24 @@ export class ChurchesService {
     return this.view(Number(saved.id));
   }
 
-  async list() {
-    const rows = await this.churchesRepo.find({ order: { id: "DESC" } });
+  async list(tag?: string | string[], excludeTag?: string | string[]) {
+    await this.ensureLgNetworkChurchTag();
+    const tagTerms = this.normalizeTagFilter(tag);
+    const excludeTerms = this.normalizeTagFilter(excludeTag);
+
+    let rows = await this.churchesRepo.find({ order: { id: "DESC" } });
+    if (tagTerms.length) {
+      const taggedIds = new Set(await this.getChurchIdsByTagNames(tagTerms));
+      if (!taggedIds.size) return [];
+      rows = rows.filter((church) => taggedIds.has(Number(church.id)));
+    }
+    if (excludeTerms.length) {
+      const excludedIds = new Set(await this.getChurchIdsByTagNames(excludeTerms));
+      if (excludedIds.size) {
+        rows = rows.filter((church) => !excludedIds.has(Number(church.id)));
+      }
+    }
+
     const members = await this.membersRepo.find();
     const nameById = new Map(members.map((m) => [m.id, `${m.firstName} ${m.lastName}`]));
     const tagMap = await this.loadChurchTags(rows.map((c) => Number(c.id)));
@@ -301,6 +318,66 @@ export class ChurchesService {
     return { id, deleted: true };
   }
 
+  private normalizeTagFilter(tag?: string | string[]) {
+    const raw = Array.isArray(tag) ? tag : tag != null ? [tag] : [];
+    const seen = new Set<string>();
+    const names: string[] = [];
+
+    for (const entry of raw) {
+      for (const part of String(entry || "").split(",")) {
+        const name = part.trim();
+        if (!name) continue;
+        const key = name.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        names.push(name);
+      }
+    }
+
+    return names;
+  }
+
+  private async getChurchIdsByTagNames(tagNames: string[]) {
+    if (!tagNames.length) return [];
+
+    const placeholders = tagNames.map(() => "?").join(", ");
+    try {
+      const rows: { id: string | number }[] = await this.churchesRepo.query(
+        `SELECT DISTINCT c.id AS id
+         FROM church c
+         INNER JOIN church_tag ct ON ct.church_id = c.id
+         INNER JOIN tag t ON t.id = ct.tag_id AND LOWER(t.name) IN (${placeholders})
+         ORDER BY c.id DESC`,
+        tagNames.map((name) => name.toLowerCase())
+      );
+      return rows.map((row) => Number(row.id));
+    } catch (err: any) {
+      if (err?.code === "ER_NO_SUCH_TABLE") {
+        throw new BadRequestException(
+          "church_tag table is missing. Run database/church-tags-migration.sql on the database."
+        );
+      }
+      throw err;
+    }
+  }
+
+  private async ensureLgNetworkChurchTag() {
+    const existing = await this.tagsRepo
+      .createQueryBuilder("tag")
+      .where("LOWER(tag.name) = LOWER(:name)", { name: LG_NETWORK_CHURCH_TAG })
+      .getOne();
+    if (existing) return existing;
+
+    try {
+      return await this.tagsRepo.save(this.tagsRepo.create({ name: LG_NETWORK_CHURCH_TAG }));
+    } catch {
+      return this.tagsRepo
+        .createQueryBuilder("tag")
+        .where("LOWER(tag.name) = LOWER(:name)", { name: LG_NETWORK_CHURCH_TAG })
+        .getOne();
+    }
+  }
+
   private normalizeTagNames(value: unknown): string[] {
     if (!Array.isArray(value)) return [];
     const seen = new Set<string>();
@@ -336,6 +413,7 @@ export class ChurchesService {
   }
 
   private async setChurchTags(churchId: number, value: unknown) {
+    await this.ensureLgNetworkChurchTag();
     const id = Number(churchId);
     if (!Number.isFinite(id) || id <= 0) {
       throw new BadRequestException("Invalid church id for tags");
