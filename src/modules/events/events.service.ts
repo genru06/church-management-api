@@ -1123,9 +1123,23 @@ export class EventsService {
       const member = await this.membersRepo.findOne({ where: { id: memberId! } });
       if (!member) throw new NotFoundException("Member not found");
       await this.ensureLifegroupMembership(member.id, lifegroupId);
-      if (churchId) {
-        await this.membersRepo.update(member.id, { churchId });
+      const name = this.buildParticipantName(body, `${member.firstName} ${member.lastName}`);
+      let firstName = name.firstName;
+      let lastName = name.lastName;
+      if ((!firstName || !lastName) && name.fullName) {
+        const parts = name.fullName.split(/\s+/).filter(Boolean);
+        if (parts.length >= 2) {
+          firstName = firstName || parts[0];
+          lastName = lastName || parts.slice(1).join(" ");
+        }
       }
+      await this.membersRepo.update(member.id, {
+        firstName: firstName || member.firstName,
+        lastName: lastName || member.lastName,
+        email: body.email !== undefined ? body.email || null : member.email,
+        phone: body.phone !== undefined ? body.phone || null : member.phone,
+        ...(churchId ? { churchId } : {})
+      });
     } else {
       const name = this.buildParticipantName(body, existing.fullName);
       if (name.firstName && name.lastName) {
@@ -1142,7 +1156,7 @@ export class EventsService {
     }
 
     const member = memberId ? await this.membersRepo.findOne({ where: { id: memberId } }) : null;
-    const fullName = member ? `${member.firstName} ${member.lastName}` : body.fullName?.trim() || existing.fullName;
+    const fullName = body.fullName?.trim() || (member ? `${member.firstName} ${member.lastName}` : existing.fullName);
 
     await this.participantsRepo.update(participantId, {
       memberId,
