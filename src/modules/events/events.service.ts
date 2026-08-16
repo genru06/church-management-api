@@ -1837,17 +1837,25 @@ export class EventsService {
     return Number(event.registrationFee || 0) > 0;
   }
 
+  private async mapCheckInParticipant(
+    participant: EventParticipantEntity,
+    extras: Record<string, unknown> = {}
+  ) {
+    const [enriched] = await this.enrichParticipants([participant]);
+    return { ...enriched, ...extras };
+  }
+
   private async markParticipantAttended(
     event: EventEntity,
     participant: EventParticipantEntity,
     overrideUnpaid = false
   ) {
     if (participant.attendedAt) {
-      return { ...this.mapParticipant(participant), alreadyCheckedIn: true };
+      return this.mapCheckInParticipant(participant, { alreadyCheckedIn: true });
     }
 
     if (this.isPaidEvent(event) && !participant.registrationPaid && !overrideUnpaid) {
-      const mapped = this.mapParticipant(participant);
+      const mapped = await this.mapCheckInParticipant(participant);
       throw new BadRequestException({
         code: "UNPAID",
         message: `${mapped.fullName || "This participant"} has not paid the registration fee.`,
@@ -1857,7 +1865,7 @@ export class EventsService {
 
     participant.attendedAt = new Date();
     const updated = await this.participantsRepo.save(participant);
-    return { ...this.mapParticipant(updated), alreadyCheckedIn: false };
+    return this.mapCheckInParticipant(updated, { alreadyCheckedIn: false });
   }
 
   async cancelCheckIn(eventId: number, participantId: number) {
@@ -1866,12 +1874,12 @@ export class EventsService {
     if (!participant) throw new NotFoundException("Participant not found");
 
     if (!participant.attendedAt) {
-      return { ...this.mapParticipant(participant), alreadyCancelled: true };
+      return this.mapCheckInParticipant(participant, { alreadyCancelled: true });
     }
 
     participant.attendedAt = null;
     const updated = await this.participantsRepo.save(participant);
-    return { ...this.mapParticipant(updated), alreadyCancelled: false };
+    return this.mapCheckInParticipant(updated, { alreadyCancelled: false });
   }
 
   async payRegistration(eventId: number, participantId: number, body: any) {
@@ -2043,7 +2051,10 @@ export class EventsService {
       .trim();
     if (!groupName) throw new BadRequestException("Group name is required");
 
-    await this.assertReservationUnique(eventId, groupName, reservationId);
+    const nameChanged = groupName.toLowerCase() !== String(existing.label || "").trim().toLowerCase();
+    if (nameChanged) {
+      await this.assertReservationUnique(eventId, groupName, reservationId);
+    }
 
     await this.reservationsRepo.update(reservationId, {
       churchId: null,
@@ -2063,7 +2074,7 @@ export class EventsService {
     const rows = await this.reservationsRepo.find({ where: { eventId } });
     const nameKey = groupName.trim().toLowerCase();
     const duplicate = rows.find((row) => {
-      if (excludeId && row.id === excludeId) return false;
+      if (excludeId != null && Number(row.id) === Number(excludeId)) return false;
       return row.label.trim().toLowerCase() === nameKey;
     });
     if (duplicate) {
