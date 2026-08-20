@@ -5,6 +5,8 @@ import { EventEntity } from "../../entities/event.entity";
 import { EventParticipantEntity } from "../../entities/event-participant.entity";
 import { EventPledgeEntity } from "../../entities/event-pledge.entity";
 import { EventReservationEntity } from "../../entities/event-reservation.entity";
+import { EventSessionEntity } from "../../entities/event-session.entity";
+import { EventAttendanceEntity } from "../../entities/event-attendance.entity";
 import { MemberEntity } from "../../entities/member.entity";
 import { UserEntity } from "../../entities/user.entity";
 import { ChurchEntity } from "../../entities/church.entity";
@@ -34,6 +36,8 @@ export class EventsService {
     @InjectRepository(EventPledgeEntity) private readonly pledgesRepo: Repository<EventPledgeEntity>,
     @InjectRepository(EventReservationEntity)
     private readonly reservationsRepo: Repository<EventReservationEntity>,
+    @InjectRepository(EventSessionEntity) private readonly sessionsRepo: Repository<EventSessionEntity>,
+    @InjectRepository(EventAttendanceEntity) private readonly attendanceRepo: Repository<EventAttendanceEntity>,
     @InjectRepository(MemberEntity) private readonly membersRepo: Repository<MemberEntity>,
     @InjectRepository(UserEntity) private readonly usersRepo: Repository<UserEntity>,
     @InjectRepository(ChurchEntity) private readonly churchesRepo: Repository<ChurchEntity>,
@@ -68,17 +72,86 @@ export class EventsService {
     return trimmed;
   }
 
-  private getRegistrationStatus(event: EventEntity) {
+  private toDateOnly(value: string | Date | null | undefined) {
+    if (!value) return null;
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      return trimmed ? trimmed.slice(0, 10) : null;
+    }
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+      return value.toISOString().slice(0, 10);
+    }
+    return null;
+  }
+
+  private todayDateOnly() {
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  private mapSession(row: EventSessionEntity, index = 0) {
+    const sessionDate = this.toDateOnly(row.sessionDate) || String(row.sessionDate);
+    return {
+      id: Number(row.id),
+      eventId: Number(row.eventId),
+      sessionDate,
+      sortOrder: Number(row.sortOrder || index + 1),
+      label: `Day ${index + 1}`
+    };
+  }
+
+  private mapSessions(rows: EventSessionEntity[]) {
+    return [...rows]
+      .sort((a, b) => {
+        const dateA = this.toDateOnly(a.sessionDate) || "";
+        const dateB = this.toDateOnly(b.sessionDate) || "";
+        if (dateA !== dateB) return dateA.localeCompare(dateB);
+        return Number(a.id) - Number(b.id);
+      })
+      .map((row, index) => this.mapSession(row, index));
+  }
+
+  private fallbackSessions(event: EventEntity) {
+    const eventDate = this.toDateOnly(event.eventDate);
+    if (!eventDate) return [];
+    return [
+      {
+        id: null as number | null,
+        eventId: Number(event.id),
+        sessionDate: eventDate,
+        sortOrder: 1,
+        label: "Day 1"
+      }
+    ];
+  }
+
+  private parseEventDates(body: any, existing?: EventEntity) {
+    let raw: unknown[] = [];
+    if (body?.eventDates !== undefined) {
+      raw = Array.isArray(body.eventDates) ? body.eventDates : [body.eventDates];
+    } else if (body?.eventDate !== undefined) {
+      raw = [body.eventDate];
+    } else if (existing?.eventDate) {
+      raw = [existing.eventDate];
+    }
+
+    return [
+      ...new Set(raw.map((value) => this.toDateOnly(value as string | Date | null)).filter(Boolean) as string[])
+    ].sort();
+  }
+
+  private lastEventDate(event: EventEntity, sessions: Array<{ sessionDate: string }> = []) {
+    if (sessions.length) return sessions[sessions.length - 1].sessionDate;
+    return this.toDateOnly(event.eventDate);
+  }
+
+  private getRegistrationStatus(event: EventEntity, sessions: Array<{ sessionDate: string }> = []) {
     if (event.status !== "published") {
       return { registrationOpen: false, registrationClosedReason: "Registration is only available for published events." };
     }
-    if (event.eventDate) {
-      const today = new Date().toISOString().slice(0, 10);
-      const eventDate =
-        typeof event.eventDate === "string"
-          ? event.eventDate.slice(0, 10)
-          : new Date(event.eventDate).toISOString().slice(0, 10);
-      if (eventDate < today) {
+    const lastDate = this.lastEventDate(event, sessions);
+    if (lastDate) {
+      const today = this.todayDateOnly();
+      if (lastDate < today) {
         return { registrationOpen: false, registrationClosedReason: "Registration is closed because the event date has passed." };
       }
     }
@@ -86,11 +159,13 @@ export class EventsService {
   }
 
   private mapEvent(row: EventEntity, extras: Record<string, unknown> = {}) {
-    const registration = this.getRegistrationStatus(row);
+    const sessions = (extras.sessions as Array<{ sessionDate: string }>) || [];
+    const eventDates = sessions.map((session) => session.sessionDate);
+    const eventDate = eventDates[0] || this.toDateOnly(row.eventDate);
+    const registration = this.getRegistrationStatus(row, sessions);
     return {
       id: row.id,
       name: row.name,
-      eventDate: row.eventDate,
       eventTime: this.normalizeEventTime(row.eventTime),
       location: row.location,
       description: row.description,
@@ -111,7 +186,10 @@ export class EventsService {
       updatedBy: row.updatedBy,
       registrationOpen: registration.registrationOpen,
       registrationClosedReason: registration.registrationClosedReason,
-      ...extras
+      ...extras,
+      eventDate,
+      eventDates,
+      sessions
     };
   }
 
@@ -130,6 +208,7 @@ export class EventsService {
       reservationId?: number | null;
       reservationLabel?: string | null;
       memberQrToken?: string | null;
+      attendance?: Array<{ sessionId: number; sessionDate: string; attendedAt: Date }>;
     } = {}
   ) {
     return {
@@ -150,6 +229,7 @@ export class EventsService {
       qrToken: row.qrToken,
       memberQrToken: extras.memberQrToken ?? null,
       attendedAt: row.attendedAt,
+      attendance: extras.attendance ?? [],
       registrationPaid: row.registrationPaid,
       registrationAmount: row.registrationAmount ? Number(row.registrationAmount) : null,
       createdAt: row.createdAt,
@@ -224,6 +304,32 @@ export class EventsService {
     const churches = churchIds.length ? await this.churchesRepo.find({ where: { id: In(churchIds) } }) : [];
     const churchNameById = new Map(churches.map((church) => [church.id, getChurchDisplayName(church)]));
 
+    const participantIds = rows.map((row) => Number(row.id));
+    const attendanceRows = participantIds.length
+      ? await this.attendanceRepo.find({ where: { participantId: In(participantIds) } })
+      : [];
+    const sessionIds = [...new Set(attendanceRows.map((row) => Number(row.sessionId)))];
+    const attendanceSessions = sessionIds.length
+      ? await this.sessionsRepo.find({ where: { id: In(sessionIds) } })
+      : [];
+    const sessionDateById = new Map(
+      attendanceSessions.map((session) => [Number(session.id), this.toDateOnly(session.sessionDate) || ""])
+    );
+    const attendanceByParticipantId = new Map<
+      number,
+      Array<{ sessionId: number; sessionDate: string; attendedAt: Date }>
+    >();
+    for (const row of attendanceRows) {
+      const participantId = Number(row.participantId);
+      const list = attendanceByParticipantId.get(participantId) || [];
+      list.push({
+        sessionId: Number(row.sessionId),
+        sessionDate: sessionDateById.get(Number(row.sessionId)) || "",
+        attendedAt: row.attendedAt
+      });
+      attendanceByParticipantId.set(participantId, list);
+    }
+
     const lifegroupByMemberId = new Map<number, LifeGroupEntity>();
     for (const link of links) {
       if (!lifegroupByMemberId.has(link.memberId)) {
@@ -272,7 +378,8 @@ export class EventsService {
             lifegroupName: lifegroup?.name ?? null,
             reservationId: reservation?.id ?? row.reservationId ?? null,
             reservationLabel: reservation?.label ?? null,
-            memberQrToken: member?.qrToken ?? null
+            memberQrToken: member?.qrToken ?? null,
+            attendance: attendanceByParticipantId.get(Number(row.id)) || []
           }),
           tags,
           isKid,
@@ -293,7 +400,8 @@ export class EventsService {
   }
 
   private async assertRegistrationOpen(event: EventEntity) {
-    const status = this.getRegistrationStatus(event);
+    const sessions = await this.listMappedSessions(event);
+    const status = this.getRegistrationStatus(event, sessions);
     if (!status.registrationOpen) {
       throw new BadRequestException(status.registrationClosedReason || "Registration is not open.");
     }
@@ -594,6 +702,116 @@ export class EventsService {
     return row;
   }
 
+  private async loadSessionsByEventIds(eventIds: number[]) {
+    const map = new Map<number, ReturnType<EventsService["mapSession"]>[]>();
+    if (!eventIds.length) return map;
+
+    const rows = await this.sessionsRepo.find({ where: { eventId: In(eventIds) } });
+    const grouped = new Map<number, EventSessionEntity[]>();
+    for (const row of rows) {
+      const eventId = Number(row.eventId);
+      const list = grouped.get(eventId) || [];
+      list.push(row);
+      grouped.set(eventId, list);
+    }
+
+    for (const [eventId, list] of grouped.entries()) {
+      map.set(eventId, this.mapSessions(list));
+    }
+    return map;
+  }
+
+  private async listMappedSessions(event: EventEntity) {
+    const rows = await this.sessionsRepo.find({ where: { eventId: event.id } });
+    const mapped = this.mapSessions(rows);
+    return mapped.length ? mapped : this.fallbackSessions(event);
+  }
+
+  private async ensurePersistedSessions(event: EventEntity) {
+    const existing = await this.sessionsRepo.find({ where: { eventId: event.id } });
+    if (existing.length) return this.mapSessions(existing);
+
+    const dates = this.parseEventDates({ eventDate: event.eventDate }, event);
+    if (!dates.length) return [];
+    return this.syncSessions(Number(event.id), dates);
+  }
+
+  private async syncSessions(eventId: number, dates: string[]) {
+    const uniqueDates = [...new Set(dates.map((value) => this.toDateOnly(value)).filter(Boolean) as string[])].sort();
+    const existing = await this.sessionsRepo.find({ where: { eventId } });
+    const existingByDate = new Map(
+      existing.map((row) => [this.toDateOnly(row.sessionDate) || "", row])
+    );
+
+    const keepIds = new Set<number>();
+    for (let index = 0; index < uniqueDates.length; index += 1) {
+      const sessionDate = uniqueDates[index];
+      const current = existingByDate.get(sessionDate);
+      if (current) {
+        if (Number(current.sortOrder) !== index + 1) {
+          await this.sessionsRepo.update(current.id, { sortOrder: index + 1 });
+        }
+        keepIds.add(Number(current.id));
+        continue;
+      }
+
+      const saved = await this.sessionsRepo.save(
+        this.sessionsRepo.create({
+          eventId,
+          sessionDate,
+          sortOrder: index + 1
+        })
+      );
+      keepIds.add(Number(saved.id));
+    }
+
+    const removed = existing.filter((row) => !keepIds.has(Number(row.id)));
+    if (removed.length) {
+      const removedIds = removed.map((row) => Number(row.id));
+      await this.attendanceRepo.delete({ sessionId: In(removedIds) });
+      await this.sessionsRepo.delete({ id: In(removedIds) });
+    }
+
+    await this.eventsRepo.update(eventId, { eventDate: uniqueDates[0] || null });
+    const refreshed = await this.sessionsRepo.find({ where: { eventId } });
+    return this.mapSessions(refreshed);
+  }
+
+  private pickDefaultSession(
+    sessions: Array<{ id: number | null; sessionDate: string; label?: string }>,
+    preferredId?: number | null
+  ) {
+    if (!sessions.length) return null;
+    if (preferredId) {
+      const match = sessions.find((session) => Number(session.id) === Number(preferredId));
+      if (match) return match;
+    }
+    const today = this.todayDateOnly();
+    const todaySession = sessions.find((session) => session.sessionDate === today);
+    if (todaySession) return todaySession;
+    const pastOrToday = sessions.filter((session) => session.sessionDate <= today);
+    if (pastOrToday.length) return pastOrToday[pastOrToday.length - 1];
+    return sessions[0];
+  }
+
+  private async resolveCheckInSession(event: EventEntity, body: any = {}) {
+    let sessions = await this.ensurePersistedSessions(event);
+    if (!sessions.length) {
+      const sessionDate = this.toDateOnly(body?.sessionDate) || this.todayDateOnly();
+      sessions = await this.syncSessions(Number(event.id), [sessionDate]);
+    }
+
+    const sessionId = body?.sessionId != null && body.sessionId !== "" ? Number(body.sessionId) : null;
+    const sessionDate = this.toDateOnly(body?.sessionDate);
+    const preferred =
+      (sessionId ? sessions.find((session) => Number(session.id) === sessionId) : null) ||
+      (sessionDate ? sessions.find((session) => session.sessionDate === sessionDate) : null) ||
+      this.pickDefaultSession(sessions, sessionId);
+
+    if (!preferred?.id) throw new BadRequestException("Event date is required for attendance.");
+    return preferred;
+  }
+
   private validateEventBody(body: any, isCreate = false) {
     if (isCreate && !body?.name) throw new BadRequestException("Event name is required");
     if (isCreate && !body?.eventTime) throw new BadRequestException("Event time is required");
@@ -602,9 +820,13 @@ export class EventsService {
   }
 
   private buildEventPayload(body: any, existing?: EventEntity) {
+    const dates = this.parseEventDates(body, existing);
     return {
       name: body.name ?? existing?.name,
-      eventDate: body.eventDate !== undefined ? body.eventDate || null : existing?.eventDate ?? null,
+      eventDate:
+        body.eventDates !== undefined || body.eventDate !== undefined
+          ? dates[0] || null
+          : existing?.eventDate ?? null,
       eventTime: this.normalizeEventTime(body.eventTime ?? existing?.eventTime),
       location: body.location ?? existing?.location,
       description: body.description ?? existing?.description,
@@ -635,6 +857,7 @@ export class EventsService {
   async add(body: any) {
     this.validateEventBody(body, true);
     const saved = await this.eventsRepo.save(this.eventsRepo.create(this.buildEventPayload(body)));
+    await this.syncSessions(Number(saved.id), this.parseEventDates(body, saved));
     return this.view(saved.id);
   }
 
@@ -643,12 +866,14 @@ export class EventsService {
     const userIds = [...new Set(rows.flatMap((r) => [r.createdBy, r.updatedBy].filter(Boolean) as number[]))];
     const users = userIds.length ? await this.usersRepo.find({ where: { id: In(userIds) } }) : [];
     const nameById = new Map(users.map((u) => [u.id, u.fullName]));
+    const sessionsByEventId = await this.loadSessionsByEventIds(rows.map((row) => Number(row.id)));
 
     return Promise.all(
       rows.map(async (row) => {
         const participantCount = await this.participantsRepo.count({ where: { eventId: row.id } });
         return this.mapEvent(row, {
           participantCount,
+          sessions: sessionsByEventId.get(Number(row.id)) || this.fallbackSessions(row),
           createdByName: row.createdBy ? nameById.get(row.createdBy) || "-" : "-",
           updatedByName: row.updatedBy ? nameById.get(row.updatedBy) || "-" : "-"
         });
@@ -661,18 +886,24 @@ export class EventsService {
     const createdByName = await this.resolveUserName(row.createdBy);
     const updatedByName = await this.resolveUserName(row.updatedBy);
     const participantCount = await this.participantsRepo.count({ where: { eventId: id } });
-    return this.mapEvent(row, { participantCount, createdByName, updatedByName });
+    const sessions = await this.ensurePersistedSessions(row);
+    return this.mapEvent(row, { participantCount, createdByName, updatedByName, sessions });
   }
 
   async edit(id: number, body: any) {
     const existing = await this.getEventOrFail(id);
     this.validateEventBody({ ...existing, ...body });
     await this.eventsRepo.update(id, this.buildEventPayload(body, existing));
+    if (body.eventDates !== undefined || body.eventDate !== undefined) {
+      await this.syncSessions(id, this.parseEventDates(body, existing));
+    }
     return this.view(id);
   }
 
   async remove(id: number) {
     await this.getEventOrFail(id);
+    await this.attendanceRepo.delete({ eventId: id });
+    await this.sessionsRepo.delete({ eventId: id });
     await this.reservationsRepo.delete({ eventId: id });
     await this.pledgesRepo.delete({ eventId: id });
     await this.participantsRepo.delete({ eventId: id });
@@ -1406,6 +1637,7 @@ export class EventsService {
     await this.getEventOrFail(eventId);
     const existing = await this.participantsRepo.findOne({ where: { id: participantId, eventId } });
     if (!existing) throw new NotFoundException("Participant not found");
+    await this.attendanceRepo.delete({ participantId });
     await this.participantsRepo.delete(participantId);
     return { id: participantId, deleted: true };
   }
@@ -1749,6 +1981,7 @@ export class EventsService {
 
   async checkIn(eventId: number, body: any) {
     const event = await this.getEventOrFail(eventId);
+    const session = await this.resolveCheckInSession(event, body);
     const overrideUnpaid = body?.overrideUnpaid === true || body?.override === true;
     const token = body.token?.trim();
     const memberId = body.memberId != null && body.memberId !== "" ? Number(body.memberId) : NaN;
@@ -1758,14 +1991,14 @@ export class EventsService {
 
     // Staff manual check-in by member ID (no QR token required)
     if (isManualMemberId) {
-      return this.checkInMember(event, memberId, undefined, overrideUnpaid);
+      return this.checkInMember(event, memberId, undefined, overrideUnpaid, session);
     }
 
     if (!token) throw new BadRequestException("Invalid check-in payload");
 
     // Member identity QR (works across all events)
     if (body.type === "member" || body.memberId) {
-      return this.checkInByMemberQr(event, Number(body.memberId), token, overrideUnpaid);
+      return this.checkInByMemberQr(event, Number(body.memberId), token, overrideUnpaid, session);
     }
 
     // Legacy / guest participant QR (scoped to one registration)
@@ -1775,14 +2008,15 @@ export class EventsService {
     const participant = await this.participantsRepo.findOne({ where: { id: participantId, eventId } });
     if (!participant) throw new NotFoundException("Participant not found");
     if (participant.qrToken !== token) throw new BadRequestException("Invalid QR token");
-    return this.markParticipantAttended(event, participant, overrideUnpaid);
+    return this.markParticipantAttended(event, participant, overrideUnpaid, session);
   }
 
   private async checkInByMemberQr(
     event: EventEntity,
     memberId: number,
     token: string,
-    overrideUnpaid = false
+    overrideUnpaid = false,
+    session?: { id: number | null; sessionDate: string; label?: string }
   ) {
     const resolvedMemberId = Number(memberId);
     if (!Number.isFinite(resolvedMemberId) || resolvedMemberId <= 0) {
@@ -1795,14 +2029,15 @@ export class EventsService {
       throw new BadRequestException("Invalid QR token");
     }
 
-    return this.checkInMember(event, Number(member.id), member, overrideUnpaid);
+    return this.checkInMember(event, Number(member.id), member, overrideUnpaid, session);
   }
 
   private async checkInMember(
     event: EventEntity,
     memberId: number,
     memberEntity?: MemberEntity | null,
-    overrideUnpaid = false
+    overrideUnpaid = false,
+    session?: { id: number | null; sessionDate: string; label?: string }
   ) {
     // MySQL bigint IDs often arrive as strings — coerce before Number.isFinite checks.
     const resolvedMemberId = Number(memberId);
@@ -1830,7 +2065,7 @@ export class EventsService {
       if (!participant) throw new NotFoundException("Participant not found");
     }
 
-    return this.markParticipantAttended(event, participant, overrideUnpaid);
+    return this.markParticipantAttended(event, participant, overrideUnpaid, session);
   }
 
   private isPaidEvent(event: EventEntity) {
@@ -1848,10 +2083,22 @@ export class EventsService {
   private async markParticipantAttended(
     event: EventEntity,
     participant: EventParticipantEntity,
-    overrideUnpaid = false
+    overrideUnpaid = false,
+    session?: { id: number | null; sessionDate: string; label?: string }
   ) {
-    if (participant.attendedAt) {
-      return this.mapCheckInParticipant(participant, { alreadyCheckedIn: true });
+    const resolvedSession = session || (await this.resolveCheckInSession(event));
+    if (!resolvedSession?.id) throw new BadRequestException("Event date is required for attendance.");
+
+    const existingAttendance = await this.attendanceRepo.findOne({
+      where: { participantId: Number(participant.id), sessionId: Number(resolvedSession.id) }
+    });
+    if (existingAttendance) {
+      return this.mapCheckInParticipant(participant, {
+        alreadyCheckedIn: true,
+        sessionId: Number(resolvedSession.id),
+        sessionDate: resolvedSession.sessionDate,
+        sessionLabel: resolvedSession.label || null
+      });
     }
 
     if (this.isPaidEvent(event) && !participant.registrationPaid && !overrideUnpaid) {
@@ -1863,23 +2110,63 @@ export class EventsService {
       });
     }
 
-    participant.attendedAt = new Date();
-    const updated = await this.participantsRepo.save(participant);
-    return this.mapCheckInParticipant(updated, { alreadyCheckedIn: false });
+    const attendedAt = new Date();
+    await this.attendanceRepo.save(
+      this.attendanceRepo.create({
+        eventId: Number(event.id),
+        participantId: Number(participant.id),
+        sessionId: Number(resolvedSession.id),
+        attendedAt
+      })
+    );
+
+    if (!participant.attendedAt) {
+      participant.attendedAt = attendedAt;
+      await this.participantsRepo.save(participant);
+    }
+
+    const updated = await this.participantsRepo.findOne({ where: { id: Number(participant.id) } });
+    return this.mapCheckInParticipant(updated || participant, {
+      alreadyCheckedIn: false,
+      sessionId: Number(resolvedSession.id),
+      sessionDate: resolvedSession.sessionDate,
+      sessionLabel: resolvedSession.label || null
+    });
   }
 
-  async cancelCheckIn(eventId: number, participantId: number) {
-    await this.getEventOrFail(eventId);
+  async cancelCheckIn(eventId: number, participantId: number, body: any = {}) {
+    const event = await this.getEventOrFail(eventId);
     const participant = await this.participantsRepo.findOne({ where: { id: participantId, eventId } });
     if (!participant) throw new NotFoundException("Participant not found");
 
-    if (!participant.attendedAt) {
-      return this.mapCheckInParticipant(participant, { alreadyCancelled: true });
+    const session = await this.resolveCheckInSession(event, body);
+    const existingAttendance = await this.attendanceRepo.findOne({
+      where: { participantId: Number(participant.id), sessionId: Number(session.id) }
+    });
+
+    if (!existingAttendance) {
+      return this.mapCheckInParticipant(participant, {
+        alreadyCancelled: true,
+        sessionId: Number(session.id),
+        sessionDate: session.sessionDate,
+        sessionLabel: session.label || null
+      });
     }
 
-    participant.attendedAt = null;
-    const updated = await this.participantsRepo.save(participant);
-    return this.mapCheckInParticipant(updated, { alreadyCancelled: false });
+    await this.attendanceRepo.delete({ id: existingAttendance.id });
+    const remaining = await this.attendanceRepo.count({ where: { participantId: Number(participant.id) } });
+    if (!remaining) {
+      participant.attendedAt = null;
+      await this.participantsRepo.save(participant);
+    }
+
+    const updated = await this.participantsRepo.findOne({ where: { id: Number(participant.id) } });
+    return this.mapCheckInParticipant(updated || participant, {
+      alreadyCancelled: false,
+      sessionId: Number(session.id),
+      sessionDate: session.sessionDate,
+      sessionLabel: session.label || null
+    });
   }
 
   async payRegistration(eventId: number, participantId: number, body: any) {
@@ -2171,6 +2458,24 @@ export class EventsService {
         ? Number(event.reservedParticipants)
         : reservations.reduce((sum, row) => sum + row.reservedCount, 0);
 
+    const sessions = (event.sessions || []) as Array<{
+      id: number | null;
+      sessionDate: string;
+      label?: string;
+    }>;
+    const sessionStats = sessions.map((session) => {
+      const attendedForSession = session.id
+        ? participants.filter((p) =>
+            (p.attendance || []).some((row: { sessionId: number }) => Number(row.sessionId) === Number(session.id))
+          ).length
+        : participants.filter((p) => p.attendedAt).length;
+      return {
+        ...session,
+        attendedCount: attendedForSession,
+        attendanceRate: participants.length ? Math.round((attendedForSession / participants.length) * 100) : 0
+      };
+    });
+
     return {
       event,
       participants,
@@ -2187,7 +2492,8 @@ export class EventsService {
         registrationCollected,
         pledgesCollected,
         pledgesTotal,
-        totalCollected: registrationCollected + pledgesCollected
+        totalCollected: registrationCollected + pledgesCollected,
+        sessionStats
       }
     };
   }
@@ -2212,11 +2518,12 @@ export class EventsService {
 
   async getSignupInfo(eventId: number) {
     const event = await this.getEventOrFail(eventId);
-    const registration = this.getRegistrationStatus(event);
+    const sessions = await this.listMappedSessions(event);
+    const registration = this.getRegistrationStatus(event, sessions);
     const options = await this.loadSignupOptions();
     const reservations = await this.listReservations(eventId);
     return {
-      event: this.mapEvent(event),
+      event: this.mapEvent(event, { sessions }),
       ...registration,
       ...options,
       reservations: reservations
@@ -2238,11 +2545,14 @@ export class EventsService {
     if (!participant) throw new NotFoundException("Registration not found");
 
     const [enriched] = await this.enrichParticipants([participant]);
+    const sessions = await this.listMappedSessions(event);
     return {
       event: {
         id: event.id,
         name: event.name,
-        eventDate: event.eventDate,
+        eventDate: this.toDateOnly(event.eventDate),
+        eventDates: sessions.map((session) => session.sessionDate),
+        sessions,
         eventTime: this.normalizeEventTime(event.eventTime),
         location: event.location,
         registrationFee: fee

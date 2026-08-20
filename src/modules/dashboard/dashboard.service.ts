@@ -75,7 +75,8 @@ export class DashboardService {
   }
 
   private async loadUpcomingEvents() {
-    const rows = await this.eventsRepo.query(
+    try {
+      const rows = await this.eventsRepo.query(
       `SELECT
         e.id,
         e.name,
@@ -85,11 +86,25 @@ export class DashboardService {
         e.status,
         e.expected_participants AS expectedParticipants,
         e.reserved_participants AS reservedParticipants,
-        COUNT(ep.id) AS registeredParticipants
+        COUNT(ep.id) AS registeredParticipants,
+        (
+          SELECT GROUP_CONCAT(s.session_date ORDER BY s.session_date)
+          FROM event_session s
+          WHERE s.event_id = e.id
+        ) AS eventDates
       FROM event e
       LEFT JOIN event_participant ep ON ep.event_id = e.id
       WHERE e.status NOT IN ('cancelled', 'completed')
-        AND (e.event_date IS NULL OR e.event_date >= CURDATE())
+        AND (
+          e.event_date IS NULL
+          OR e.event_date >= CURDATE()
+          OR EXISTS (
+            SELECT 1
+            FROM event_session s
+            WHERE s.event_id = e.id
+              AND s.session_date >= CURDATE()
+          )
+        )
       GROUP BY e.id, e.name, e.event_date, e.event_time, e.location, e.status, e.expected_participants, e.reserved_participants
       ORDER BY e.event_date IS NULL ASC, e.event_date ASC, e.event_time ASC, e.id ASC
       LIMIT 10`
@@ -99,6 +114,10 @@ export class DashboardService {
       id: Number(row.id),
       name: row.name,
       eventDate: row.eventDate || null,
+      eventDates: String(row.eventDates || "")
+        .split(",")
+        .map((value) => value.trim().slice(0, 10))
+        .filter(Boolean),
       eventTime: row.eventTime || null,
       location: row.location,
       status: row.status,
@@ -106,5 +125,39 @@ export class DashboardService {
       reservedParticipants: row.reservedParticipants != null ? Number(row.reservedParticipants) : 0,
       registeredParticipants: Number(row.registeredParticipants || 0)
     }));
+    } catch (err: any) {
+      if (err?.code !== "ER_NO_SUCH_TABLE") throw err;
+      const rows = await this.eventsRepo.query(
+        `SELECT
+          e.id,
+          e.name,
+          e.event_date AS eventDate,
+          e.event_time AS eventTime,
+          e.location,
+          e.status,
+          e.expected_participants AS expectedParticipants,
+          e.reserved_participants AS reservedParticipants,
+          COUNT(ep.id) AS registeredParticipants
+        FROM event e
+        LEFT JOIN event_participant ep ON ep.event_id = e.id
+        WHERE e.status NOT IN ('cancelled', 'completed')
+          AND (e.event_date IS NULL OR e.event_date >= CURDATE())
+        GROUP BY e.id, e.name, e.event_date, e.event_time, e.location, e.status, e.expected_participants, e.reserved_participants
+        ORDER BY e.event_date IS NULL ASC, e.event_date ASC, e.event_time ASC, e.id ASC
+        LIMIT 10`
+      );
+      return rows.map((row: any) => ({
+        id: Number(row.id),
+        name: row.name,
+        eventDate: row.eventDate || null,
+        eventDates: [],
+        eventTime: row.eventTime || null,
+        location: row.location,
+        status: row.status,
+        expectedParticipants: row.expectedParticipants != null ? Number(row.expectedParticipants) : null,
+        reservedParticipants: row.reservedParticipants != null ? Number(row.reservedParticipants) : 0,
+        registeredParticipants: Number(row.registeredParticipants || 0)
+      }));
+    }
   }
 }

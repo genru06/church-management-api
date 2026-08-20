@@ -114,8 +114,8 @@ export class EventsController {
   }
 
   @Post(":id/checkin/:participantId/cancel")
-  cancelCheckIn(@Param("id") id: string, @Param("participantId") participantId: string) {
-    return this.eventsService.cancelCheckIn(Number(id), Number(participantId));
+  cancelCheckIn(@Param("id") id: string, @Param("participantId") participantId: string, @Body() body: any) {
+    return this.eventsService.cancelCheckIn(Number(id), Number(participantId), body);
   }
 
   @Post(":id/participants/:participantId/pay")
