@@ -29,6 +29,8 @@ import { AclResourceEntity } from "../entities/acl-resource.entity";
 import { TagAclEntity } from "../entities/tag-acl.entity";
 import { AclController } from "../modules/acl/acl.controller";
 import { AclService } from "../modules/acl/acl.service";
+import { PrintController } from "../modules/print/print.controller";
+import { PrintService } from "../modules/print/print.service";
 import { UserEntity } from "../entities/user.entity";
 import { UserAccessTagEntity } from "../entities/user-access-tag.entity";
 import { UserTagEntity } from "../entities/user-tag.entity";
@@ -106,7 +108,8 @@ const entities = [
     OperationsController,
     UsersController,
     TagsController,
-    AclController
+    AclController,
+    PrintController
   ],
   providers: [
     { provide: APP_GUARD, useClass: AuthGuard },
@@ -118,6 +121,7 @@ const entities = [
     AttendanceService,
     CitiesService,
     EventsService,
+    PrintService,
     OperationsService,
     UsersService,
     TagsService,
