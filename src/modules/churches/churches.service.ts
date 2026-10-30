@@ -6,7 +6,7 @@ import { ChurchTagEntity } from "../../entities/church-tag.entity";
 import { MemberEntity } from "../../entities/member.entity";
 import { LifeGroupEntity } from "../../entities/lifegroup.entity";
 import { TagEntity } from "../../entities/tag.entity";
-import { sortChurchesMainFirst } from "../../utils/church-display";
+import { getChurchDisplayName, sortChurchesMainFirst } from "../../utils/church-display";
 import { LG_NETWORK_CHURCH_TAG } from "../../utils/church-tags";
 
 @Injectable()
@@ -96,6 +96,7 @@ export class ChurchesService {
         m.last_name AS lastName,
         m.first_name AS firstName,
         m.date_of_birth AS dateOfBirth,
+        m.qr_token AS qrToken,
         CASE WHEN m.church_id = ? THEN 1 ELSE 0 END AS linkedDirectly,
         CASE WHEN EXISTS (
           SELECT 1
@@ -133,11 +134,15 @@ export class ChurchesService {
       memberParams
     );
 
+    const churchName = getChurchDisplayName(row);
     return rows.map((member: any) => ({
       id: Number(member.id),
       lastName: member.lastName,
       firstName: member.firstName,
       dateOfBirth: member.dateOfBirth || null,
+      qrToken: member.qrToken || null,
+      churchId: id,
+      church: churchName || null,
       lifeGroup: member.lifeGroup || null,
       tags: member.tags ? String(member.tags).split(", ") : [],
       linkType: this.formatMemberLinkType(
